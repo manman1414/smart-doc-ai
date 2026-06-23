@@ -127,8 +127,6 @@ export function getConversation(id: string): ConversationRow | undefined {
 /** 创建会话 */
 export function createConversation(row: ConversationRow): void {
   const d = getDb();
-  console.log('d',d);
-  
   d.prepare(`
     INSERT INTO conversations (id, document_name, document_size, summary, doc_id, messages, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)

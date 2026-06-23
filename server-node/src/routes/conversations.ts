@@ -94,7 +94,6 @@ router.put('/:id/messages', (req: Request, res: Response) => {
 router.get('/:id', (req: Request, res: Response) => {
   try {
     const row = getConversation(req.params.id);
-    // console.log('row', row);
 
     if (!row) {
       return sendJsonError(res, 404, '会话不存在');

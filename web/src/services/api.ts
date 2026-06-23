@@ -275,14 +275,11 @@ export async function getConversations(): Promise<Conversation[]> {
   try {
     const response = await fetch(`${getApiBase()}/conversations`);
     if (!response.ok) {
-      console.error('获取会话列表失败:', response.status, response.statusText);
       return [];
     }
     const data = await response.json();
-    console.log('getConversations 返回:', data.length, '条记录');
     return data;
-  } catch (err) {
-    console.error('getConversations 网络错误:', err);
+  } catch {
     return [];
   }
 }
