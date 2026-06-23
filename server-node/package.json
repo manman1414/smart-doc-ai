@@ -1,0 +1,30 @@
+{
+  "name": "server-node",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "multer": "^2.2.0",
+    "undici": "^7.28.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/multer": "^2.1.0",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "node scripts/smoke-e2e.mjs",
+    "test:smoke": "node scripts/smoke-upload-phase1.mjs",
+    "test:e2e": "node scripts/smoke-e2e.mjs"
+  }
+}

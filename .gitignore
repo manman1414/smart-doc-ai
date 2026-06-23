@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+server-python/venv/
+
+# Build output
+server-node/dist/
+web/dist/
+web/src/.umi/
+web/src/.umi-production/
+web/src/.umi-test/
+.swc
+.turbopack
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Runtime data (local DB / vectors / uploads)
+data/
+server-node/db/
+server-node/uploads/
+*.db
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Logs & cache
+*.log
+.cache/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+
+# Test fixtures (generated locally)
+server-node/scripts/fixtures/
