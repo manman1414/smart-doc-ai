@@ -113,6 +113,8 @@ router.get('/process/:taskId', async (req: Request, res: Response) => {
     if (typeof (res as any).flush === 'function') (res as any).flush();
   };
 
+  const yieldLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
   let clientGone = false;
   const isGone = () => clientGone || Boolean(req.aborted) || ac!.signal.aborted;
 
@@ -168,7 +170,18 @@ router.get('/process/:taskId', async (req: Request, res: Response) => {
           try {
             const evt = JSON.parse(payload);
             if (evt.stage === 'reading') {
-              send({ stage: 'vectorize', progress: 30, message: '正在读取文档…' });
+              // Python reading progress 5~10 → 整体 28~35；优先展示页码文案
+              const page = Number(evt.page) || 0;
+              const total = Number(evt.total) || 0;
+              const readPct = Number(evt.progress);
+              const mapped = Number.isFinite(readPct)
+                ? Math.min(35, Math.max(28, 28 + Math.round(((readPct - 5) / 5) * 7)))
+                : (total > 0 && page > 0 ? 28 + Math.round((page / total) * 7) : 30);
+              const msg =
+                evt.message ||
+                (total > 0 ? `正在解析第 ${page}/${total} 页…` : '正在读取文档…');
+              send({ stage: 'vectorize', progress: mapped, message: msg });
+              await yieldLoop();
             } else if (evt.stage === 'chunking') {
               send({ stage: 'vectorize', progress: 35, message: '正在分块…' });
             } else if (evt.stage === 'embedding') {
@@ -177,6 +190,7 @@ router.get('/process/:taskId', async (req: Request, res: Response) => {
                 progress: mapEmbedProgress(evt.progress, evt.done, evt.total),
                 message: `分析文档 ${evt.done}/${evt.total}`,
               });
+              await yieldLoop();
             } else if (evt.stage === 'done') {
               docId = evt.doc_id || '';
             } else if (evt.stage === 'error') {
@@ -208,10 +222,11 @@ router.get('/process/:taskId', async (req: Request, res: Response) => {
 
     let summaryResp: globalThis.Response;
     try {
-      summaryResp = await fetch(`${pythonUrl}/ai/summarize`, {
+      // 入库后按 doc_id 分段摘要（覆盖全文，不依赖临时文件截断）
+      summaryResp = await fetch(`${pythonUrl}/ai/summarize-doc`, {
         signal: ac.signal, method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filePath: task.filePath, originalName: task.originalName }),
+        body: JSON.stringify({ doc_id: docId }),
       });
     } finally {
       clearInterval(summarizeTimer);

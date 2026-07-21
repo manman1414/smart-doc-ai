@@ -63,7 +63,12 @@ pydantic==2.13.4
 pydantic-settings==2.14.2
 pydantic_core==2.46.4
 Pygments==2.20.0
-PyPDF2==3.0.1
+pdfplumber==0.11.8
+PyMuPDF>=1.26.7
+rapidocr>=3.0.0
+rapid-table>=3.0.0
+opencv-python-headless>=4.11.0.86
+Pillow>=11.3.0
 PyPika==0.51.1
 pyproject_hooks==1.2.0
 python-dateutil==2.9.0.post0

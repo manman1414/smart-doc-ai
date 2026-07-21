@@ -10,12 +10,10 @@ const router = Router();
 router.post('/ask', async (req: Request, res: Response) => {
   try {
     const { question, doc_id, history } = req.body;
-
     if (!question || !doc_id) {
       return sendJsonError(res, 400, '请提供问题和文档信息');
     }
-
-    const pythonUrl = process.env.PYTHON_AI_URL || 'http://localhost:8000';
+    const pythonUrl= process.env.PYTHON_AI_URL || 'http://localhost:8000';
     const abortController = new AbortController();
     const timeoutId = setTimeout(() => abortController.abort(), 120_000);
     const response = await fetch(`${pythonUrl}/ai/ask`, {
@@ -30,7 +28,7 @@ router.post('/ask', async (req: Request, res: Response) => {
       throw new Error('AI 服务异常');
     }
 
-    // ★ 直接 pipe Python 的 SSE 流到前端
+    // 直接 pipe Python 的 SSE 流到前端
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');

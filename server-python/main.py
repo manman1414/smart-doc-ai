@@ -9,11 +9,50 @@ import uuid
 import sys
 import asyncio
 import threading
-from services.chunker import chunk_text
-from services.vector_store import collection, search_similar, delete_doc_vectors, get_doc_text
-from services.embedder import embed_text
+import queue
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="SmartDoc AI Core", version="0.1.0")
+from services.chunker import chunk_pages
+from services.vector_store import (
+    collection,
+    search_similar,
+    delete_doc_vectors,
+    get_doc_text,
+    format_chunks_for_prompt,
+    doc_chunk_count,
+)
+from services.embedder import embed_documents, warmup_embedder
+from services.parser import read_file_content, is_read_error, iter_parse_events
+from services.summarizer import summarize_document
+
+
+def _warmup_models_background() -> None:
+    """启动后后台预热，避免第一次提问卡在加载/下载模型。"""
+    flag = (os.environ.get("SMARTDOC_WARMUP") or "1").strip().lower()
+    if flag in ("0", "false", "off", "no"):
+        print("[WARMUP] skipped by SMARTDOC_WARMUP", flush=True)
+        return
+    try:
+        print("[WARMUP] embedder ...", flush=True)
+        warmup_embedder()
+        from services.reranker import warmup_reranker
+
+        print("[WARMUP] reranker ...", flush=True)
+        warmup_reranker()
+        print("[WARMUP] done", flush=True)
+    except Exception as e:
+        print(f"[WARMUP] failed: {e}", flush=True)
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    threading.Thread(
+        target=_warmup_models_background, daemon=True, name="model-warmup"
+    ).start()
+    yield
+
+
+app = FastAPI(title="SmartDoc AI Core", version="0.1.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,46 +84,6 @@ class AskRequest(BaseModel):
     doc_id: str
     history: list = []
 
-def read_file_content(file_path: str, original_name: str) -> str:
-    if not file_path:
-        return "[错误：文件路径为空]"
-    ext = original_name.split('.')[-1].lower() if '.' in original_name else ''
-    if ext == 'pdf':
-        try:
-            import pdfplumber
-            text = ""
-            with pdfplumber.open(file_path) as pdf:
-                for page in pdf.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text += page_text + "\n"
-            if not text.strip():
-                return "[PDF解析错误：文档中没有可提取的文字]"
-            return text
-        except Exception as e:
-            return f"[PDF解析错误: {str(e)}]"
-    elif ext == 'txt':
-        try:
-            if not os.path.exists(file_path):
-                return f"[TXT读取错误：文件不存在 {file_path}]"
-            for encoding in ['utf-8', 'gbk', 'latin-1']:
-                try:
-                    with open(file_path, 'r', encoding=encoding) as f:
-                        content = f.read()
-                    if content.strip():
-                        return content
-                except UnicodeDecodeError:
-                    continue
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            if not content.strip():
-                return "[TXT读取错误：文件内容为空]"
-            return content
-        except Exception as e:
-            return f"[TXT读取错误: {str(e)}]"
-    else:
-        return f"[不支持的文件类型: .{ext}]"
-
 # ==================== 文档处理（SSE 流式 + 可取消） ====================
 
 @app.post("/ai/process-document")
@@ -110,48 +109,140 @@ async def process_document(req: ProcessRequest, request: Request):
         wrote_vectors = False
 
         try:
-            yield f"data: {json.dumps({'stage': 'reading', 'progress': 5})}\n\n"
-            full_text = await loop.run_in_executor(None, read_file_content, req.filePath, req.originalName)
+            # 解析阶段：子线程按页推送 progress，主协程转 SSE
+            parse_q: queue.Queue = queue.Queue()
+
+            def run_parse():
+                try:
+                    for event in iter_parse_events(
+                        req.filePath,
+                        req.originalName,
+                        cancel_check=cancelled.is_set,
+                    ):
+                        parse_q.put(event)
+                        if event.get("type") in ("error", "result"):
+                            break
+                except Exception as e:
+                    parse_q.put({"type": "error", "message": f"[PDF解析错误: {e}]"})
+                finally:
+                    parse_q.put(None)
+
+            parse_future = loop.run_in_executor(None, run_parse)
+            full_text = ""
+            pages: list = []
+            while True:
+                item = await loop.run_in_executor(None, parse_q.get)
+                if item is None:
+                    break
+                et = item.get("type")
+                if et == "progress":
+                    yield f"data: {json.dumps({k: item[k] for k in ('stage', 'progress', 'page', 'total', 'mode', 'message', 'image_coverage', 'ocr', 'strategy') if k in item})}\n\n"
+                elif et == "error":
+                    msg = item.get("message") or "解析失败"
+                    if cancelled.is_set() or "取消" in str(msg):
+                        yield f"data: {json.dumps({'stage': 'error', 'message': '请求已取消'})}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'stage': 'error', 'message': f'文件读取失败：{msg}'})}\n\n"
+                    await parse_future
+                    return
+                elif et == "result":
+                    full_text = item.get("text") or ""
+                    pages = item.get("pages") or []
+
+            await parse_future
 
             if cancelled.is_set():
                 yield f"data: {json.dumps({'stage': 'error', 'message': '请求已取消'})}\n\n"
                 return
-            if not full_text or full_text.startswith("["):
+            if is_read_error(full_text):
                 yield f"data: {json.dumps({'stage': 'error', 'message': f'文件读取失败：{full_text}'})}\n\n"
                 return
 
+            # TXT / 纯文字页 → recursive；有表图的页 → structure（按页选型）
+            src_ext = ""
+            if "." in (req.originalName or ""):
+                src_ext = req.originalName.rsplit(".", 1)[-1].lower()
+
+            if not pages and full_text.strip():
+                # TXT 无页码；PDF 等缺 pages 时兜底为第 1 页
+                pages = [
+                    {
+                        "page": 0 if src_ext == "txt" else 1,
+                        "text": full_text,
+                    }
+                ]
+
             yield f"data: {json.dumps({'stage': 'chunking', 'progress': 10})}\n\n"
-            chunks = chunk_text(full_text)
-            total = len(chunks)
-            if not chunks:
+            chunk_items = chunk_pages(pages, source_ext=src_ext)
+            total = len(chunk_items)
+            kind_stat: dict[str, int] = {}
+            strategy_stat: dict[str, int] = {}
+            for c in chunk_items:
+                k = str(c.get("kind") or "text")
+                kind_stat[k] = kind_stat.get(k, 0) + 1
+                s = str(c.get("strategy") or "")
+                if s:
+                    strategy_stat[s] = strategy_stat.get(s, 0) + 1
+            print(
+                f"[MAIN] chunking done chars={len(full_text)} pages={len(pages)} "
+                f"chunks={total} strategies={strategy_stat} kinds={kind_stat}",
+                flush=True,
+            )
+            if not chunk_items:
                 yield f"data: {json.dumps({'stage': 'error', 'message': '文本为空'})}\n\n"
                 return
 
+            # 同 doc_id 先清再建，避免重复上传 / 重试残留
+            await loop.run_in_executor(None, delete_doc_vectors, doc_id)
+
             BATCH_SIZE = 20
-            for start in range(0, total, BATCH_SIZE):
-                if cancelled.is_set():
-                    if wrote_vectors:
-                        await loop.run_in_executor(None, delete_doc_vectors, doc_id)
-                    yield f"data: {json.dumps({'stage': 'error', 'message': '请求已取消'})}\n\n"
-                    return
+            try:
+                for start in range(0, total, BATCH_SIZE):
+                    if cancelled.is_set():
+                        if wrote_vectors:
+                            await loop.run_in_executor(None, delete_doc_vectors, doc_id)
+                        yield f"data: {json.dumps({'stage': 'error', 'message': '请求已取消'})}\n\n"
+                        return
 
-                batch = chunks[start:start + BATCH_SIZE]
-                batch_ids = [f"{doc_id}_chunk_{i}" for i in range(start, start + len(batch))]
-                batch_metadatas = [{"doc_id": doc_id, "chunk_index": i} for i in range(start, start + len(batch))]
+                    batch_items = chunk_items[start:start + BATCH_SIZE]
+                    batch = [c["text"] for c in batch_items]
+                    batch_ids = [f"{doc_id}_chunk_{i}" for i in range(start, start + len(batch))]
+                    batch_metadatas = [
+                        {
+                            "doc_id": doc_id,
+                            "chunk_index": start + j,
+                            # TXT：强制 page=0，不在提示里标「第 N 页」
+                            "page": (
+                                0
+                                if src_ext == "txt"
+                                else int(batch_items[j].get("page") or 1)
+                            ),
+                            "kind": str(batch_items[j].get("kind") or "text"),
+                            "source_ext": src_ext or "",
+                        }
+                        for j in range(len(batch_items))
+                    ]
 
-                embeddings = await loop.run_in_executor(None, embed_text, batch)
+                    embeddings = await loop.run_in_executor(None, embed_documents, batch)
 
-                collection.add(
-                    embeddings=embeddings,
-                    documents=batch,
-                    ids=batch_ids,
-                    metadatas=batch_metadatas
-                )
-                wrote_vectors = True
+                    collection.add(
+                        embeddings=embeddings,
+                        documents=batch,
+                        ids=batch_ids,
+                        metadatas=batch_metadatas,
+                    )
+                    wrote_vectors = True
 
-                done = min(start + len(batch), total)
-                pct = 10 + int(85 * done / total)
-                yield f"data: {json.dumps({'stage': 'embedding', 'progress': pct, 'done': done, 'total': total})}\n\n"
+                    done = min(start + len(batch), total)
+                    pct = 10 + int(85 * done / total)
+                    yield f"data: {json.dumps({'stage': 'embedding', 'progress': pct, 'done': done, 'total': total})}\n\n"
+                    await asyncio.sleep(0)
+            except Exception as e:
+                print(f"[MAIN] embed/store FAILED doc_id={doc_id}: {e}", flush=True)
+                if wrote_vectors:
+                    await loop.run_in_executor(None, delete_doc_vectors, doc_id)
+                yield f"data: {json.dumps({'stage': 'error', 'message': f'向量化失败：{e}'})}\n\n"
+                return
 
             if cancelled.is_set():
                 if wrote_vectors:
@@ -175,16 +266,67 @@ async def process_document(req: ProcessRequest, request: Request):
 
 def sse_ask(req: AskRequest):
     print(f"[MAIN] sse_ask START question={req.question[:50]}... doc_id={req.doc_id}", flush=True)
-    relevant_chunks = search_similar(req.question, doc_id=req.doc_id, top_k=3)
+    relevant_chunks = search_similar(req.question, doc_id=req.doc_id)
     if not relevant_chunks:
-        yield f"data: {json.dumps({'error': '未找到相关文档内容，请先上传文档。'})}\n\n"
+        if req.doc_id and doc_chunk_count(req.doc_id) > 0:
+            msg = "未找到与问题足够相关的内容，请换种问法或换个角度描述。"
+        else:
+            msg = "未找到相关文档内容，请先上传文档。"
+        yield f"data: {json.dumps({'error': msg})}\n\n"
         return
 
-    context = "\n\n".join(relevant_chunks)
-    messages = [{"role": "system", "content": "你是一个文档问答助手。请根据提供的文档内容回答用户问题。"}]
+    context = format_chunks_for_prompt(relevant_chunks)
+    pages = sorted(
+        {
+            int(c.get("page") or 0)
+            for c in relevant_chunks
+            if int(c.get("page") or 0) > 0
+        }
+    )
+    is_txt = any(
+        str(c.get("source_ext") or "").lower() == "txt" for c in relevant_chunks
+    )
+    has_pages = bool(pages) and not is_txt
+    scores = [c.get("score") for c in relevant_chunks]
+    print(
+        f"[MAIN] sse_ask retrieved chunks={len(relevant_chunks)} pages={pages} "
+        f"has_pages={has_pages} scores={scores} context_chars={len(context)}",
+        flush=True,
+    )
+
+    if has_pages:
+        system_content = (
+            "你是一个文档问答助手。请根据提供的文档片段回答用户问题。"
+            "每个片段前标有【第N页】。"
+            "要求：1）每条信息只写一次，列表项禁止重复；"
+            "2）若依据某页内容，在相关处用（第N页）标注来源，不要编造页码；"
+            "3）回答简洁，直接给结论与必要说明。"
+        )
+        user_tail = "请基于以上文档简洁回答（勿重复），并标注页码来源："
+    else:
+        system_content = (
+            "你是一个文档问答助手。请根据提供的文档片段回答用户问题。"
+            "要求：1）每条信息只写一次，列表项禁止重复；"
+            "2）不要标注页码（本文档无页码概念）；"
+            "3）回答简洁，直接给结论与必要说明。"
+        )
+        user_tail = "请基于以上文档简洁回答（勿重复），不要标注页码："
+
+    messages = [{"role": "system", "content": system_content}]
     for msg in req.history[-10:]:
-        messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
-    messages.append({"role": "user", "content": f"文档内容：\n{context}\n\n用户问题：{req.question}\n\n请基于以上文档内容回答："})
+        messages.append(
+            {"role": msg.get("role", "user"), "content": msg.get("content", "")}
+        )
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                f"文档内容：\n{context}\n\n"
+                f"用户问题：{req.question}\n\n"
+                f"{user_tail}"
+            ),
+        }
+    )
 
     try:
         stream = client.chat.completions.create(
@@ -195,7 +337,8 @@ def sse_ask(req: AskRequest):
             delta = chunk.choices[0].delta
             if delta.content:
                 yield f"data: {json.dumps({'token': delta.content})}\n\n"
-        yield f"data: {json.dumps({'done': True})}\n\n"
+        sources = [{"page": p} for p in pages]
+        yield f"data: {json.dumps({'done': True, 'sources': sources})}\n\n"
     except Exception as e:
         yield f"data: {json.dumps({'error': f'AI 回答生成失败：{str(e)}'})}\n\n"
 
@@ -237,31 +380,30 @@ async def summarize(req: SummarizeRequest, request: Request):
 
     loop = asyncio.get_event_loop()
     full_text = await loop.run_in_executor(None, read_file_content, req.filePath, req.originalName)
-    if not full_text or full_text.startswith("["):
+    if is_read_error(full_text):
         return {"summary": f"文件内容提取失败：{full_text}"}
 
-    return await _generate_summary_from_text(full_text[:3000], request)
+    return await _generate_summary_from_text(full_text, request)
 
 
 @app.post("/ai/summarize-doc")
 async def summarize_doc(req: SummarizeDocRequest, request: Request):
-    """LM 恢复后按 doc_id 从 Chroma 重试摘要（上传临时文件已删除）"""
+    """按 doc_id 从 Chroma 取全文做分段摘要（上传完成后 / 重试摘要）。"""
     if await request.is_disconnected():
         return {"summary": "请求已取消"}
     if not req.doc_id:
         return {"summary": "文件内容提取失败：缺少 doc_id"}
 
     loop = asyncio.get_event_loop()
-    full_text = await loop.run_in_executor(None, get_doc_text, req.doc_id, 8000)
+    # max_chars=0：取全文，由 summarizer 分段控制调用次数
+    full_text = await loop.run_in_executor(None, get_doc_text, req.doc_id, 0)
     if not full_text:
         return {"summary": "文件内容提取失败：文档向量不存在或为空"}
 
-    return await _generate_summary_from_text(full_text[:3000], request)
+    return await _generate_summary_from_text(full_text, request)
 
 
 async def _generate_summary_from_text(prompt_text: str, request: Request) -> dict:
-    prompt = f"请用中文简要总结以下文档的核心内容（200字以内）：\n---\n{prompt_text}\n---\n摘要："
-
     stop = threading.Event()
 
     async def watch_disconnect():
@@ -272,7 +414,9 @@ async def _generate_summary_from_text(prompt_text: str, request: Request) -> dic
                 return
             await asyncio.sleep(0.1)
 
-    def run_llm_stream():
+    def llm_complete(prompt: str) -> str:
+        if stop.is_set():
+            return ""
         stream = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
@@ -289,9 +433,16 @@ async def _generate_summary_from_text(prompt_text: str, request: Request) -> dic
                 parts.append(delta)
         return "".join(parts).strip()
 
+    def run_summary() -> str:
+        return summarize_document(
+            prompt_text,
+            llm_complete=llm_complete,
+            cancel_check=stop.is_set,
+        )
+
     loop = asyncio.get_event_loop()
     watch_task = asyncio.create_task(watch_disconnect())
-    llm_future = loop.run_in_executor(None, run_llm_stream)
+    llm_future = loop.run_in_executor(None, run_summary)
 
     try:
         done, _ = await asyncio.wait(
@@ -346,3 +497,8 @@ async def list_doc_ids():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

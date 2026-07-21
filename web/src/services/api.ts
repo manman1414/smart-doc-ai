@@ -13,12 +13,14 @@
  */
 import type { Conversation } from '@/types';
 
-/** 开发环境直连 Node:3000，避免 Umi/utoopack dev proxy 缓冲 SSE 导致进度条不实时 */
+/** 开发环境直连 Node:3000，避免 dev proxy 缓冲 SSE 导致进度条不实时 */
 export function getApiBase(): string {
   if (typeof window === 'undefined') return '/api';
-  const { port } = window.location;
-  if (process.env.NODE_ENV === 'development' && (port === '8001' || port === '8000')) {
-    return 'http://127.0.0.1:3000/api';
+  if (process.env.NODE_ENV === 'development') {
+    const { hostname } = window.location;
+    if (hostname === 'localhost' || hostname === '127.0.0.1') {
+      return 'http://127.0.0.1:3000/api';
+    }
   }
   return '/api';
 }
@@ -176,7 +178,11 @@ export async function processUpload(
 
       for (const line of lines) {
         const data = parseSseDataLine(line);
-        if (data) onEvent(data);
+        if (data) {
+          onEvent(data);
+          // SSE 突发多条时让浏览器有机会绘制中间帧（非 Phase2，仅 UI 刷新）
+          await new Promise((r) => setTimeout(r, 0));
+        }
       }
     }
   } catch (err: unknown) {
