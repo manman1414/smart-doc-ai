@@ -108,8 +108,9 @@ class ParserTests(unittest.TestCase):
         text = format_chunks_for_prompt(
             [{"text": "合同金额十万", "page": 3}, {"text": "交付周期", "page": 1}]
         )
-        self.assertIn("【第3页】", text)
-        self.assertIn("【第1页】", text)
+        self.assertNotIn("【第", text)
+        self.assertIn("合同金额十万", text)
+        self.assertIn("交付周期", text)
 
     def test_format_chunks_dedupes(self):
         from services.vector_store import format_chunks_for_prompt
@@ -121,7 +122,8 @@ class ParserTests(unittest.TestCase):
                 {"text": "Mixed PDF - Page 1 digital layer extra", "page": 1},
             ]
         )
-        self.assertEqual(text.count("【第1页】"), 1)
+        self.assertNotIn("【第", text)
+        self.assertEqual(text.count("Mixed PDF - Page 1 digital layer"), 1)
         self.assertIn("extra", text)
 
     def test_format_chunks_dedupes_overlap_window(self):

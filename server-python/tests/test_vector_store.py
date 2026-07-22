@@ -156,21 +156,22 @@ class SearchSimilarTests(unittest.TestCase):
 
 
 class FormatChunksTests(unittest.TestCase):
-    def test_keeps_page_marker(self):
+    def test_no_page_marker(self):
         text = format_chunks_for_prompt(
             [{"text": "合同金额十万", "page": 3}, {"text": "交付周期", "page": 1}]
         )
-        self.assertIn("【第3页】", text)
-        self.assertIn("【第1页】", text)
+        self.assertNotIn("【第", text)
+        self.assertIn("合同金额十万", text)
+        self.assertIn("交付周期", text)
 
-    def test_txt_skips_page_marker(self):
+    def test_txt_no_page_marker(self):
         text = format_chunks_for_prompt(
             [{"text": "纯文本内容", "page": 1, "source_ext": "txt"}]
         )
         self.assertNotIn("【第", text)
         self.assertIn("纯文本内容", text)
 
-    def test_page_zero_skips_marker(self):
+    def test_page_zero_plain_text(self):
         text = format_chunks_for_prompt([{"text": "无页码片段", "page": 0}])
         self.assertNotIn("【第", text)
         self.assertIn("无页码片段", text)

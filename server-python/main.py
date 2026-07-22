@@ -406,8 +406,16 @@ def sse_ask(req: AskRequest, cancel_check=None):
         yield f"data: {json.dumps({'error': msg, 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
         return
 
-    # 检索路径已去重，此处跳过二次 O(n²) 去重
-    context = format_chunks_for_prompt(relevant_chunks, dedupe=False)
+    # 主流：用检索 top_k 结果（已去重），不再额外砍到 2 段导致答不全
+    context = format_chunks_for_prompt(relevant_chunks, dedupe=True)
+    try:
+        previews = []
+        for i, c in enumerate(relevant_chunks):
+            t = (c.get("text") or "").strip().replace("\n", " ")
+            previews.append(f"#{i} p={c.get('page')} len={len(t)} {t[:40]!r}")
+        print(f"[MAIN] sse_ask context_chunks={previews}", flush=True)
+    except Exception:
+        pass
     pages = sorted(
         {
             int(c.get("page") or 0)
@@ -415,36 +423,37 @@ def sse_ask(req: AskRequest, cancel_check=None):
             if int(c.get("page") or 0) > 0
         }
     )
-    is_txt = any(
-        str(c.get("source_ext") or "").lower() == "txt" for c in relevant_chunks
-    )
-    has_pages = bool(pages) and not is_txt
     scores = [c.get("score") for c in relevant_chunks]
     print(
         f"[MAIN] sse_ask retrieved chunks={len(relevant_chunks)} pages={pages} "
-        f"has_pages={has_pages} scores={scores} context_chars={len(context)}",
+        f"scores={scores} context_chars={len(context)}",
         flush=True,
     )
 
-    if has_pages:
-        system_content = (
-            "你是一个文档问答助手。请根据提供的文档片段回答用户问题。"
-            "每个片段前标有【第N页】。"
-            "要求：1）每条信息只写一次，列表项禁止重复；"
-            "2）若依据某页内容，在相关处用（第N页）标注来源，不要编造页码；"
-            "3）可参考对话摘要与最近几轮，保持口径一致；"
-            "4）回答简洁，直接给结论与必要说明。"
-        )
-        user_tail = "请基于以上文档简洁回答（勿重复），并标注页码来源："
-    else:
-        system_content = (
-            "你是一个文档问答助手。请根据提供的文档片段回答用户问题。"
-            "要求：1）每条信息只写一次，列表项禁止重复；"
-            "2）不要标注页码（本文档无页码概念）；"
-            "3）可参考对话摘要与最近几轮，保持口径一致；"
-            "4）回答简洁，直接给结论与必要说明。"
-        )
-        user_tail = "请基于以上文档简洁回答（勿重复），不要标注页码："
+    # 统一提示：不要求、不展示页码标注
+    system_content = (
+        "你是文档问答助手。根据【文档片段】回答用户问题。"
+        "写作规则（必须遵守）：\n"
+        "1. 完整覆盖问题相关要点，不要为了短而漏掉关键信息。\n"
+        "2. 每个要点只写一次：禁止复读、禁止把同一段话再说一遍、"
+        "禁止同一标题内容重复出现。\n"
+        "3. 多个片段若讲同一事实，合并成一条写。\n"
+        "4. 不要按片段顺序逐段改写；要综合后输出一份终稿。\n"
+        "5. 分条或分段均可，写完即止，不要回过头再抄一遍。\n"
+        "6. 不要标注页码或出处页（如「第N页」）。"
+    )
+    user_tail = (
+        "请综合文档片段给出一份完整答案（每个要点只出现一次，不要标注页码）。"
+        "开始回答："
+    )
+
+    ctx_blocks: list[str] = []
+    for i, c in enumerate(relevant_chunks, 1):
+        t = (c.get("text") or "").strip()
+        if not t:
+            continue
+        ctx_blocks.append(f"【片段{i}】\n{t}")
+    context_numbered = "\n\n".join(ctx_blocks) if ctx_blocks else context
 
     messages = [{"role": "system", "content": system_content}]
     messages.extend(build_history_prompt_messages(memory_summary, recent))
@@ -452,8 +461,9 @@ def sse_ask(req: AskRequest, cancel_check=None):
         {
             "role": "user",
             "content": (
-                f"文档内容：\n{context}\n\n"
-                f"用户问题：{req.question}\n\n"
+                f"【文档片段】（可能互相重叠，请合并理解，勿逐段复述）\n"
+                f"{context_numbered}\n\n"
+                f"【用户问题】\n{req.question}\n\n"
                 f"{user_tail}"
             ),
         }
@@ -463,10 +473,26 @@ def sse_ask(req: AskRequest, cancel_check=None):
         if _cancelled():
             yield f"data: {json.dumps({'error': '请求已取消', 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
             return
-        stream = client.chat.completions.create(
-            model=MODEL_NAME, messages=messages,
-            temperature=0.3, max_tokens=500, stream=True,
-        )
+        try:
+            stream = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=800,
+                frequency_penalty=0.45,
+                presence_penalty=0.15,
+                stream=True,
+            )
+        except Exception as e_pen:
+            print(f"[MAIN] sse_ask penalty unsupported, fallback: {e_pen}", flush=True)
+            stream = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=800,
+                stream=True,
+            )
+        # 真·SSE：模型出 token 立刻下发（不做收齐后再推）
         for chunk in stream:
             if _cancelled():
                 print("[MAIN] sse_ask cancelled mid-stream", flush=True)
@@ -494,7 +520,7 @@ async def ask(req: AskRequest, request: Request):
 
     async def generate():
         loop = asyncio.get_event_loop()
-        out_q: queue.Queue = queue.Queue(maxsize=64)
+        out_q: queue.Queue = queue.Queue(maxsize=256)
         cancel = threading.Event()
 
         def worker():

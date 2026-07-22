@@ -467,9 +467,8 @@ def search_similar(
 
 
 def format_chunks_for_prompt(chunks: list[dict], *, dedupe: bool = True) -> str:
-    """把带页码的片段格式化成给大模型的上下文。
+    """把检索片段格式化成给大模型的上下文（不加页码标注）。
 
-    TXT（source_ext=txt 或 page<=0）不加【第N页】。
     dedupe=False：跳过二次去重（检索路径已去重时用）。
     """
     unique = _dedupe_chunks(chunks) if dedupe else list(chunks or [])
@@ -478,16 +477,7 @@ def format_chunks_for_prompt(chunks: list[dict], *, dedupe: bool = True) -> str:
         text = (c.get("text") or "").strip()
         if not text:
             continue
-        ext = str(c.get("source_ext") or "").lower().lstrip(".")
-        page = c.get("page") or 0
-        try:
-            page = int(page)
-        except (TypeError, ValueError):
-            page = 0
-        if ext == "txt" or page <= 0:
-            blocks.append(text)
-        else:
-            blocks.append(f"【第{page}页】\n{text}")
+        blocks.append(text)
     return "\n\n".join(blocks)
 
 
@@ -511,11 +501,20 @@ def _text_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
-def _dedupe_chunks(chunks: list[dict], sim_thresh: float = 0.72) -> list[dict]:
+def _dedupe_sim_threshold() -> float:
+    raw = os.environ.get("SMARTDOC_DEDUPE_SIM", "0.72")
+    try:
+        return min(0.95, max(0.4, float(raw)))
+    except ValueError:
+        return 0.72
+
+
+def _dedupe_chunks(chunks: list[dict], sim_thresh: float | None = None) -> list[dict]:
     """
     去掉相同 / 包含 / 高度相似的片段（分块 overlap、相近检索易导致复读）。
     保序：按传入顺序（一般为相似度从高到低）。
     """
+    thresh = _dedupe_sim_threshold() if sim_thresh is None else float(sim_thresh)
     kept: list[dict] = []
     for c in chunks or []:
         text = (c.get("text") or "").strip()
@@ -531,7 +530,7 @@ def _dedupe_chunks(chunks: list[dict], sim_thresh: float = 0.72) -> list[dict]:
             if not pn:
                 continue
             sim = _text_similarity(n, pn)
-            if sim >= sim_thresh:
+            if sim >= thresh:
                 if len(n) > len(pn):
                     replace_at = i
                 else:
