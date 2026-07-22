@@ -202,11 +202,19 @@ export async function* streamChat(
   docId: string,
   history: { role: string; content: string }[] = [],
   signal?: AbortSignal,
-): AsyncGenerator<{ text: string; done: boolean }> {
+  memorySummary: string = '',
+  memoryCovered: number = 0,
+): AsyncGenerator<{ text: string; done: boolean; memorySummary?: string; memoryCovered?: number }> {
   const response = await fetch(`${getApiBase()}/chat/ask`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, doc_id: docId, history }),
+    body: JSON.stringify({
+      question,
+      doc_id: docId,
+      history,
+      memory_summary: memorySummary || '',
+      memory_covered: memoryCovered || 0,
+    }),
     signal,
   });
 
@@ -219,10 +227,12 @@ export async function* streamChat(
   const decoder = new TextDecoder();
   let buffer = '';
   let fullText = '';
+  let latestMemory = memorySummary || '';
+  let latestCovered = memoryCovered || 0;
 
   while (true) {
     if (signal?.aborted) {
-      yield { text: fullText, done: true };
+      yield { text: fullText, done: true, memorySummary: latestMemory, memoryCovered: latestCovered };
       return;
     }
 
@@ -239,9 +249,20 @@ export async function* streamChat(
         const raw = trimmed.slice(trimmed.startsWith('data: ') ? 6 : 5).trim();
         try {
           const data = JSON.parse(raw);
+          if (typeof data.memory_summary === 'string') {
+            latestMemory = data.memory_summary;
+          }
+          if (typeof data.memory_covered === 'number') {
+            latestCovered = data.memory_covered;
+          }
           if (data.error) throw new Error(data.error);
           if (data.done) {
-            yield { text: fullText, done: true };
+            yield {
+              text: fullText,
+              done: true,
+              memorySummary: latestMemory,
+              memoryCovered: latestCovered,
+            };
             return;
           }
           if (data.token) {
@@ -258,7 +279,12 @@ export async function* streamChat(
     }
   }
 
-  yield { text: fullText, done: true };
+  yield {
+    text: fullText,
+    done: true,
+    memorySummary: latestMemory,
+    memoryCovered: latestCovered,
+  };
 }
 
 /** LM 恢复后按 doc_id 重试生成摘要 */
@@ -307,6 +333,8 @@ export async function saveConversation(conv: Conversation): Promise<void> {
       summary: conv.summary,
       docId: conv.docId,
       createdAt: conv.createdAt,
+      memorySummary: conv.memorySummary || '',
+      memoryCovered: conv.memoryCovered || 0,
     }),
   });
   if (!response.ok) {

@@ -9,7 +9,7 @@ const router = Router();
  */
 router.post('/ask', async (req: Request, res: Response) => {
   try {
-    const { question, doc_id, history } = req.body;
+    const { question, doc_id, history, memory_summary, memory_covered } = req.body;
     if (!question || !doc_id) {
       return sendJsonError(res, 400, '请提供问题和文档信息');
     }
@@ -20,7 +20,13 @@ router.post('/ask', async (req: Request, res: Response) => {
       signal: abortController.signal,
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, doc_id, history }),
+      body: JSON.stringify({
+        question,
+        doc_id,
+        history: history || [],
+        memory_summary: memory_summary || '',
+        memory_covered: memory_covered || 0,
+      }),
     });
     clearTimeout(timeoutId);
 

@@ -36,7 +36,9 @@ function initTables(database: Database.Database): void {
       summary       TEXT    DEFAULT '',
       doc_id        TEXT    DEFAULT '',
       messages      TEXT    DEFAULT '[]',
-      created_at    TEXT    NOT NULL
+      created_at    TEXT    NOT NULL,
+      memory_summary TEXT   DEFAULT '',
+      memory_covered INTEGER DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS doc_registry (
@@ -45,6 +47,15 @@ function initTables(database: Database.Database): void {
       conversation_id TEXT DEFAULT NULL
     );
   `);
+
+  // 兼容旧库：补齐 memory_summary / memory_covered 列
+  const cols = database.prepare(`PRAGMA table_info(conversations)`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === 'memory_summary')) {
+    database.exec(`ALTER TABLE conversations ADD COLUMN memory_summary TEXT DEFAULT ''`);
+  }
+  if (!cols.some((c) => c.name === 'memory_covered')) {
+    database.exec(`ALTER TABLE conversations ADD COLUMN memory_covered INTEGER DEFAULT 0`);
+  }
 }
 
 // ==================== 文档向量注册（对账宽限期） ====================
@@ -110,6 +121,8 @@ export interface ConversationRow {
   doc_id: string;
   messages: string;  // JSON 字符串
   created_at: string;
+  memory_summary?: string;
+  memory_covered?: number;
 }
 
 /** 获取所有会话列表（按创建时间倒序） */
@@ -128,15 +141,37 @@ export function getConversation(id: string): ConversationRow | undefined {
 export function createConversation(row: ConversationRow): void {
   const d = getDb();
   d.prepare(`
-    INSERT INTO conversations (id, document_name, document_size, summary, doc_id, messages, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(row.id, row.document_name, row.document_size, row.summary, row.doc_id, row.messages, row.created_at);
+    INSERT INTO conversations (id, document_name, document_size, summary, doc_id, messages, created_at, memory_summary, memory_covered)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    row.id,
+    row.document_name,
+    row.document_size,
+    row.summary,
+    row.doc_id,
+    row.messages,
+    row.created_at,
+    row.memory_summary || '',
+    row.memory_covered || 0,
+  );
 }
 
 /** 更新会话消息 */
 export function updateConversationMessages(id: string, messages: string): void {
   const d = getDb();
   d.prepare('UPDATE conversations SET messages = ? WHERE id = ?').run(messages, id);
+}
+
+/** 更新多轮对话滚动摘要（与文档 summary 不同） */
+export function updateConversationMemorySummary(id: string, memorySummary: string): void {
+  const d = getDb();
+  d.prepare('UPDATE conversations SET memory_summary = ? WHERE id = ?').run(memorySummary || '', id);
+}
+
+/** 更新已压缩进摘要的消息条数 */
+export function updateConversationMemoryCovered(id: string, covered: number): void {
+  const d = getDb();
+  d.prepare('UPDATE conversations SET memory_covered = ? WHERE id = ?').run(covered || 0, id);
 }
 
 /** 删除会话 */

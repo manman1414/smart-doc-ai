@@ -24,6 +24,15 @@ from services.vector_store import (
 from services.embedder import embed_documents, warmup_embedder
 from services.parser import read_file_content, is_read_error, iter_parse_events
 from services.summarizer import summarize_document
+from services.conversation_memory import (
+    split_history,
+    merge_memory_summary,
+    rewrite_question,
+    build_history_prompt_messages,
+    history_keep_turns,
+    history_keep_messages,
+    normalize_history,
+)
 
 
 def _warmup_models_background() -> None:
@@ -44,10 +53,38 @@ def _warmup_models_background() -> None:
         print(f"[WARMUP] failed: {e}", flush=True)
 
 
+def _yunqi_extract_once_background() -> None:
+    """一次性：OCR 抽取云启 PDF（Shell 沙箱不可用时的旁路）。完成后写 done flag。"""
+    from pathlib import Path
+
+    scripts = Path(__file__).resolve().parent / "scripts"
+    done = scripts / "_yunqi_extract_done.flag"
+    if done.exists():
+        print("[YUNQI] extract skipped (done flag exists)", flush=True)
+        return
+    try:
+        print("[YUNQI] starting PDF extract/OCR ...", flush=True)
+        import runpy
+
+        runpy.run_path(str(scripts / "_extract_yunqi_pdf.py"), run_name="__main__")
+        print("[YUNQI] extract finished", flush=True)
+    except Exception as e:
+        print(f"[YUNQI] extract failed: {e}", flush=True)
+        try:
+            (scripts / "_yunqi_extract_done.flag").write_text(
+                f"FAILED: {e}\n", encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     threading.Thread(
         target=_warmup_models_background, daemon=True, name="model-warmup"
+    ).start()
+    threading.Thread(
+        target=_yunqi_extract_once_background, daemon=True, name="yunqi-extract"
     ).start()
     yield
 
@@ -83,6 +120,9 @@ class AskRequest(BaseModel):
     question: str
     doc_id: str
     history: list = []
+    memory_summary: str = ""
+    # 已并入 memory_summary 的 history 条数（避免每轮重复压缩）
+    memory_covered: int = 0
 
 # ==================== 文档处理（SSE 流式 + 可取消） ====================
 
@@ -264,15 +304,68 @@ async def process_document(req: ProcessRequest, request: Request):
 
 # ==================== RAG 问答 ====================
 
+def _llm_chat_text(messages: list, max_tokens: int = 300) -> str:
+    """同步短调用（摘要合并 / 提问改写）。"""
+    resp = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=max_tokens,
+        stream=False,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
 def sse_ask(req: AskRequest):
-    print(f"[MAIN] sse_ask START question={req.question[:50]}... doc_id={req.doc_id}", flush=True)
-    relevant_chunks = search_similar(req.question, doc_id=req.doc_id)
+    print(
+        f"[MAIN] sse_ask START question={req.question[:50]}... doc_id={req.doc_id} "
+        f"history={len(req.history or [])} keep_turns={history_keep_turns()}",
+        flush=True,
+    )
+
+    hist = normalize_history(req.history)
+    keep = history_keep_messages()
+    memory_summary = (req.memory_summary or "").strip()
+    try:
+        covered = max(0, int(req.memory_covered or 0))
+    except (TypeError, ValueError):
+        covered = 0
+
+    if len(hist) <= keep:
+        recent = hist
+        memory_covered = min(covered, 0)
+    else:
+        recent = hist[-keep:]
+        need_cover = len(hist) - keep
+        covered = min(covered, need_cover)
+        new_older = hist[covered:need_cover]
+        if new_older:
+            memory_summary = merge_memory_summary(
+                memory_summary, new_older, _llm_chat_text
+            )
+            print(
+                f"[MAIN] sse_ask memory +{len(new_older)} msgs "
+                f"summary_chars={len(memory_summary)}",
+                flush=True,
+            )
+        memory_covered = need_cover
+
+    search_q = rewrite_question(
+        req.question,
+        memory_summary=memory_summary,
+        recent_messages=recent,
+        chat_fn=_llm_chat_text,
+    )
+    if search_q != (req.question or "").strip():
+        print(f"[MAIN] sse_ask rewritten_q={search_q[:80]!r}", flush=True)
+
+    relevant_chunks = search_similar(search_q, doc_id=req.doc_id)
     if not relevant_chunks:
         if req.doc_id and doc_chunk_count(req.doc_id) > 0:
             msg = "未找到与问题足够相关的内容，请换种问法或换个角度描述。"
         else:
             msg = "未找到相关文档内容，请先上传文档。"
-        yield f"data: {json.dumps({'error': msg})}\n\n"
+        yield f"data: {json.dumps({'error': msg, 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
         return
 
     context = format_chunks_for_prompt(relevant_chunks)
@@ -300,7 +393,8 @@ def sse_ask(req: AskRequest):
             "每个片段前标有【第N页】。"
             "要求：1）每条信息只写一次，列表项禁止重复；"
             "2）若依据某页内容，在相关处用（第N页）标注来源，不要编造页码；"
-            "3）回答简洁，直接给结论与必要说明。"
+            "3）可参考对话摘要与最近几轮，保持口径一致；"
+            "4）回答简洁，直接给结论与必要说明。"
         )
         user_tail = "请基于以上文档简洁回答（勿重复），并标注页码来源："
     else:
@@ -308,15 +402,13 @@ def sse_ask(req: AskRequest):
             "你是一个文档问答助手。请根据提供的文档片段回答用户问题。"
             "要求：1）每条信息只写一次，列表项禁止重复；"
             "2）不要标注页码（本文档无页码概念）；"
-            "3）回答简洁，直接给结论与必要说明。"
+            "3）可参考对话摘要与最近几轮，保持口径一致；"
+            "4）回答简洁，直接给结论与必要说明。"
         )
         user_tail = "请基于以上文档简洁回答（勿重复），不要标注页码："
 
     messages = [{"role": "system", "content": system_content}]
-    for msg in req.history[-10:]:
-        messages.append(
-            {"role": msg.get("role", "user"), "content": msg.get("content", "")}
-        )
+    messages.extend(build_history_prompt_messages(memory_summary, recent))
     messages.append(
         {
             "role": "user",
@@ -338,9 +430,9 @@ def sse_ask(req: AskRequest):
             if delta.content:
                 yield f"data: {json.dumps({'token': delta.content})}\n\n"
         sources = [{"page": p} for p in pages]
-        yield f"data: {json.dumps({'done': True, 'sources': sources})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'sources': sources, 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
     except Exception as e:
-        yield f"data: {json.dumps({'error': f'AI 回答生成失败：{str(e)}'})}\n\n"
+        yield f"data: {json.dumps({'error': f'AI 回答生成失败：{str(e)}', 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
 
 @app.post("/ai/ask")
 async def ask(req: AskRequest, request: Request):

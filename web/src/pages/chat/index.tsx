@@ -89,6 +89,13 @@ const ChatPage: React.FC = () => {
    * 上传时由 Node.js 创建记录并返回，消息同步时用于 UPDATE
    */
   const [conversationId, setConversationId] = useState('');
+  /** 更早多轮的滚动摘要（与文档 summary 不同） */
+  const [memorySummary, setMemorySummary] = useState('');
+  const memorySummaryRef = useRef('');
+  useEffect(() => { memorySummaryRef.current = memorySummary; }, [memorySummary]);
+  const [memoryCovered, setMemoryCovered] = useState(0);
+  const memoryCoveredRef = useRef(0);
+  useEffect(() => { memoryCoveredRef.current = memoryCovered; }, [memoryCovered]);
   /** 会话创建时间（上传完成时捕获，写入后端后不再变化） */
   const [createdAt, setCreatedAt] = useState('');
 
@@ -203,6 +210,8 @@ const ChatPage: React.FC = () => {
       setConversationId(conv.id);
       setCreatedAt(conv.createdAt || '');
       setSummary(conv.summary);
+      setMemorySummary(conv.memorySummary || '');
+      setMemoryCovered(conv.memoryCovered || 0);
       setSummaryOk(!isSummaryError(conv.summary));
       setUploadStatus('done');
       setSuggestedQuestions(getSuggestedQuestions());
@@ -267,6 +276,8 @@ const ChatPage: React.FC = () => {
             summary: summaryRef.current,
             docId: docIdRef.current,
             createdAt: new Date().toISOString(),
+            memorySummary: memorySummaryRef.current || '',
+            memoryCovered: memoryCoveredRef.current || 0,
           }),
         }).catch(() => {});
       });
@@ -306,8 +317,10 @@ const ChatPage: React.FC = () => {
       docId,                                          // ★ 存入 ChromaDB ID，恢复会话后能继续提问
       createdAt: createdAt || new Date().toISOString(),// 首次用上传时间，兜底用当前时间
       messages: chatMessages,
+      memorySummary: memorySummary || '',
+      memoryCovered: memoryCovered || 0,
     });
-  }, [messages, summary, doc, conversationId, createdAt]);
+  }, [messages, summary, doc, conversationId, createdAt, memorySummary, memoryCovered]);
 
   // ======================== 事件处理 ========================
 
@@ -373,6 +386,8 @@ const ChatPage: React.FC = () => {
             setDocId(event.result.docId);
             setConversationId(event.result.conversationId);
             setCreatedAt(created);
+            setMemorySummary('');
+            setMemoryCovered(0);
             setSummary(event.result.summary);
             setSummaryOk(ok);
             setSuggestedQuestions(getSuggestedQuestions());
@@ -469,13 +484,24 @@ const ChatPage: React.FC = () => {
     abortCtrlRef.current = ctrl;
 
     try {
-      // ★ 传入 docId + signal 做 RAG 向量检索
-            const history = messagesRef.current
+      // ★ 传入 docId + signal 做 RAG；附带滚动摘要与完整 history（后端再拆分）
+      const history = messagesRef.current
         .filter(m => m.role !== 'system' && m.id !== 'welcome' && m.id !== 'welcome-restored')
         .map(m => ({ role: m.role, content: m.content }));
-      const gen = streamChat(text, docId, history, ctrl.signal);
-      for await (const { text: chunk, done } of gen) {
-        if (abortRef.current) break;                    // 用户点了停止       
+      const gen = streamChat(
+        text,
+        docId,
+        history,
+        ctrl.signal,
+        memorySummaryRef.current || '',
+        memoryCoveredRef.current || 0,
+      );
+      for await (const { text: chunk, done, memorySummary: nextMem, memoryCovered: nextCovered } of gen) {
+        if (abortRef.current) break;                    // 用户点了停止
+        if (done) {
+          if (typeof nextMem === 'string') setMemorySummary(nextMem);
+          if (typeof nextCovered === 'number') setMemoryCovered(nextCovered);
+        }
         setMessages(prev => prev.map(m =>
           m.id === aiMsgId ? { ...m, content: chunk, isStreaming: !done } : m
         ));
@@ -538,6 +564,8 @@ const ChatPage: React.FC = () => {
     setDoc(null);
     setDocId('');
     setConversationId('');
+    setMemorySummary('');
+    setMemoryCovered(0);
     setCreatedAt('');
     setSummary('');
     setSummaryOk(true);

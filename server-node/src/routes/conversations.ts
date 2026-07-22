@@ -15,6 +15,8 @@ import {
   linkDocToConversation,
   deleteDocRegistry,
   updateConversationSummary,
+  updateConversationMemorySummary,
+  updateConversationMemoryCovered,
 } from '../db';
 import { deleteChromaDoc } from '../services/pythonAi';
 import { sendJsonError } from '../utils/clientError';
@@ -37,6 +39,8 @@ router.get('/', (_req: Request, res: Response) => {
       docId: row.doc_id,
       messages: safeParseJson(row.messages, []),
       createdAt: row.created_at,
+      memorySummary: row.memory_summary || '',
+      memoryCovered: row.memory_covered || 0,
     }));
     res.json(conversations);
   } catch (error: any) {
@@ -47,7 +51,7 @@ router.get('/', (_req: Request, res: Response) => {
 /** 更新会话消息（有 docId 时可创建仅含文档信息的草稿会话，供刷新恢复） */
 router.put('/:id/messages', (req: Request, res: Response) => {
   try {
-    const { messages, documentName, documentSize, summary, docId, createdAt } = req.body;
+    const { messages, documentName, documentSize, summary, docId, createdAt, memorySummary, memoryCovered } = req.body;
     if (!Array.isArray(messages)) {
       return sendJsonError(res, 400, '消息格式不正确');
     }
@@ -69,6 +73,8 @@ router.put('/:id/messages', (req: Request, res: Response) => {
         doc_id: docId || '',
         messages: '[]',
         created_at: createdAt || new Date().toISOString(),
+        memory_summary: typeof memorySummary === 'string' ? memorySummary : '',
+        memory_covered: typeof memoryCovered === 'number' ? memoryCovered : 0,
       });
     }
 
@@ -78,6 +84,14 @@ router.put('/:id/messages', (req: Request, res: Response) => {
 
     if (existing && typeof summary === 'string') {
       updateConversationSummary(req.params.id, summary);
+    }
+
+    if (typeof memorySummary === 'string') {
+      updateConversationMemorySummary(req.params.id, memorySummary);
+    }
+
+    if (typeof memoryCovered === 'number') {
+      updateConversationMemoryCovered(req.params.id, memoryCovered);
     }
 
     if (messages.length > 0) {
@@ -106,6 +120,8 @@ router.get('/:id', (req: Request, res: Response) => {
       docId: row.doc_id,
       messages: safeParseJson(row.messages, []),
       createdAt: row.created_at,
+      memorySummary: row.memory_summary || '',
+      memoryCovered: row.memory_covered || 0,
     });
   } catch (error: any) {
     console.error('获取会话详情失败:', error);

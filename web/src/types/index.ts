@@ -23,6 +23,10 @@ export interface Conversation {
   docId?: string;
   createdAt: string;
   messages: Message[];
+  /** 更早多轮对话的滚动摘要（最近几轮仍用 messages 原文） */
+  memorySummary?: string;
+  /** 已并入滚动摘要的消息条数 */
+  memoryCovered?: number;
 }
 
 /** 已上传文档信息 */
