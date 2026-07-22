@@ -98,6 +98,8 @@ const ChatPage: React.FC = () => {
   useEffect(() => { memoryCoveredRef.current = memoryCovered; }, [memoryCovered]);
   /** 会话创建时间（上传完成时捕获，写入后端后不再变化） */
   const [createdAt, setCreatedAt] = useState('');
+  const createdAtRef = useRef('');
+  useEffect(() => { createdAtRef.current = createdAt; }, [createdAt]);
 
   /** 消息列表滚动容器 DOM 引用 */
   const listRef = useRef<HTMLDivElement>(null);
@@ -275,7 +277,7 @@ const ChatPage: React.FC = () => {
             documentSize: d.size,
             summary: summaryRef.current,
             docId: docIdRef.current,
-            createdAt: new Date().toISOString(),
+            createdAt: createdAtRef.current || new Date().toISOString(),
             memorySummary: memorySummaryRef.current || '',
             memoryCovered: memoryCoveredRef.current || 0,
           }),
@@ -290,37 +292,42 @@ const ChatPage: React.FC = () => {
   }, [messages]);
 
   /**
-   * 消息同步到后端 SQLite
-   * 每次 messages 变化时触发，过滤掉系统消息，仅保存 user/assistant 对话
-   * 调用 PUT /api/conversations/:id/messages
+   * 地址栏补上 conversation id（与写库解耦，流式中也可做）
    */
   useEffect(() => {
-    if (!conversationId || !doc) return;
+    if (!conversationId) return;
+    const convId = searchParams.get('conversation');
+    if (!convId) {
+      const newParams = new URLSearchParams(searchParams);
+      newParams.set('conversation', conversationId);
+      setSearchParams(newParams);
+    }
+  }, [conversationId, searchParams, setSearchParams]);
+
+  /**
+   * 消息同步到后端 SQLite
+   * 流式输出期间跳过，避免每个 token 全量写库；结束/停止后由 streaming=false 触发保存。
+   * 卸载路径另有 keepalive PUT。
+   */
+  useEffect(() => {
+    if (!conversationId || !doc || streaming) return;
     const chatMessages = messages
       .filter(m => m.role === 'user' || m.role === 'assistant')
-      .map(m => ({ ...m, isStreaming: false }));     // ★ 永不对后端持久化 isStreaming，避免刷新后残留
+      .map(m => ({ ...m, isStreaming: false }));
     if (chatMessages.length === 0) return;
-    const convId = searchParams.get('conversation');
-    //如果地址栏没id并且实际有对话，则地址栏增加id
-    if (!convId && conversationId) {
-      const newParams = new URLSearchParams(searchParams); // 复制一份
-      newParams.set('conversation', conversationId);
-      setSearchParams(newParams); // 传入新实例
-
-    }
 
     saveConvApi({
       id: conversationId,
       documentName: doc.name,
       documentSize: doc.size,
       summary,
-      docId,                                          // ★ 存入 ChromaDB ID，恢复会话后能继续提问
-      createdAt: createdAt || new Date().toISOString(),// 首次用上传时间，兜底用当前时间
+      docId,
+      createdAt: createdAt || new Date().toISOString(),
       messages: chatMessages,
       memorySummary: memorySummary || '',
       memoryCovered: memoryCovered || 0,
     });
-  }, [messages, summary, doc, conversationId, createdAt, memorySummary, memoryCovered]);
+  }, [messages, summary, doc, conversationId, createdAt, memorySummary, memoryCovered, streaming]);
 
   // ======================== 事件处理 ========================
 

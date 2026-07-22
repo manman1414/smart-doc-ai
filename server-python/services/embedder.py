@@ -10,6 +10,7 @@ BGE 文本嵌入。
 
 from __future__ import annotations
 
+import threading
 from typing import Sequence
 
 from sentence_transformers import SentenceTransformer
@@ -19,12 +20,17 @@ QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
 
 _MODEL_NAME = "BAAI/bge-small-zh-v1.5"
 _model: SentenceTransformer | None = None
+_load_lock = threading.Lock()
 
 
 def get_model() -> SentenceTransformer:
-    """懒加载，避免 import 时阻塞启动。"""
+    """懒加载，避免 import 时阻塞启动；并发双检锁防止重复加载。"""
     global _model
-    if _model is None:
+    if _model is not None:
+        return _model
+    with _load_lock:
+        if _model is not None:
+            return _model
         print(f"[EMBED] loading model {_MODEL_NAME} ...", flush=True)
         _model = SentenceTransformer(_MODEL_NAME)
         print("[EMBED] model ready", flush=True)

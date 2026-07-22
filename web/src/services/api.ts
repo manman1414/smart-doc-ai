@@ -266,11 +266,8 @@ export async function* streamChat(
             return;
           }
           if (data.token) {
-            for (const ch of data.token) {
-              fullText += ch;
-              yield { text: fullText, done: false };
-              await new Promise((r) => setTimeout(r, 10));
-            }
+            fullText += data.token;
+            yield { text: fullText, done: false };
           }
         } catch (e: any) {
           throw e;

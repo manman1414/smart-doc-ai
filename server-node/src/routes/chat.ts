@@ -3,19 +3,46 @@ import { sendJsonError, toClientError } from '../utils/clientError';
 
 const router = Router();
 
+function watchClientDisconnect(req: Request, res: Response, onDisconnect: () => void) {
+  let gone = false;
+  const markGone = (reason: string) => {
+    if (gone || res.writableFinished || res.writableEnded) return;
+    gone = true;
+    onDisconnect();
+    console.log(`[ASK] SSE 客户端断开 (${reason})`);
+  };
+  req.on('aborted', () => markGone('aborted'));
+  res.on('close', () => markGone('close'));
+}
+
 /**
  * POST /api/chat/ask
  * 转发请求到 Python AI 服务，并直接 pipe SSE 流到前端
+ * 客户端停止/关页时 abort upstream，避免 LM 空转
  */
 router.post('/ask', async (req: Request, res: Response) => {
+  const abortController = new AbortController();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let clientGone = false;
+
+  const onClientGone = () => {
+    if (clientGone) return;
+    clientGone = true;
+    abortController.abort();
+    reader?.cancel().catch(() => {});
+  };
+  watchClientDisconnect(req, res, onClientGone);
+
+  // 覆盖记忆压缩 + 改写 + 检索 + 整段流式；首包超时不宜过短
+  const timeoutId = setTimeout(() => abortController.abort(), 300_000);
+
   try {
     const { question, doc_id, history, memory_summary, memory_covered } = req.body;
     if (!question || !doc_id) {
+      clearTimeout(timeoutId);
       return sendJsonError(res, 400, '请提供问题和文档信息');
     }
-    const pythonUrl= process.env.PYTHON_AI_URL || 'http://localhost:8000';
-    const abortController = new AbortController();
-    const timeoutId = setTimeout(() => abortController.abort(), 120_000);
+    const pythonUrl = process.env.PYTHON_AI_URL || 'http://localhost:8000';
     const response = await fetch(`${pythonUrl}/ai/ask`, {
       signal: abortController.signal,
       method: 'POST',
@@ -28,36 +55,48 @@ router.post('/ask', async (req: Request, res: Response) => {
         memory_covered: memory_covered || 0,
       }),
     });
-    clearTimeout(timeoutId);
 
     if (!response.ok || !response.body) {
+      clearTimeout(timeoutId);
       throw new Error('AI 服务异常');
     }
 
-    // 直接 pipe Python 的 SSE 流到前端
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
 
-    // Node 18+ ReadableStream → pipe to Express response
-    const reader = response.body.getReader();
-    const pump = async () => {
-      while (true) {
+    reader = response.body.getReader();
+    try {
+      while (!clientGone) {
         const { done, value } = await reader.read();
-        if (done) {
-          res.end();
-          break;
+        if (done) break;
+        if (!res.writableEnded) {
+          res.write(value);
         }
-        res.write(value);
       }
-    };
-    pump().catch(() => res.end());
-
+    } finally {
+      clearTimeout(timeoutId);
+      if (!res.writableEnded) {
+        res.end();
+      }
+    }
   } catch (error: unknown) {
+    clearTimeout(timeoutId);
+    if (clientGone || (error instanceof Error && error.name === 'AbortError')) {
+      if (!res.headersSent) {
+        return sendJsonError(res, 499, '请求已取消');
+      }
+      if (!res.writableEnded) res.end();
+      return;
+    }
     console.error('问答请求失败:', error);
-    sendJsonError(res, 500, toClientError(error, '问答服务异常'));
+    if (!res.headersSent) {
+      sendJsonError(res, 500, toClientError(error, '问答服务异常'));
+    } else if (!res.writableEnded) {
+      res.end();
+    }
   }
 });
 

@@ -466,12 +466,13 @@ def search_similar(
     return out
 
 
-def format_chunks_for_prompt(chunks: list[dict]) -> str:
-    """把带页码的片段格式化成给大模型的上下文（先去重，避免模型复读）。
+def format_chunks_for_prompt(chunks: list[dict], *, dedupe: bool = True) -> str:
+    """把带页码的片段格式化成给大模型的上下文。
 
     TXT（source_ext=txt 或 page<=0）不加【第N页】。
+    dedupe=False：跳过二次去重（检索路径已去重时用）。
     """
-    unique = _dedupe_chunks(chunks)
+    unique = _dedupe_chunks(chunks) if dedupe else list(chunks or [])
     blocks: list[str] = []
     for c in unique:
         text = (c.get("text") or "").strip()

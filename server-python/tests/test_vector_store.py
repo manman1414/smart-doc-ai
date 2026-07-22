@@ -175,6 +175,17 @@ class FormatChunksTests(unittest.TestCase):
         self.assertNotIn("【第", text)
         self.assertIn("无页码片段", text)
 
+    def test_skip_dedupe_flag(self):
+        # 两段几乎相同：默认会去重；dedupe=False 应都保留
+        chunks = [
+            {"text": "合同金额十万元整ABCDEF", "page": 1},
+            {"text": "合同金额十万元整ABCDEF", "page": 2},
+        ]
+        with_d = format_chunks_for_prompt(chunks, dedupe=True)
+        no_d = format_chunks_for_prompt(chunks, dedupe=False)
+        self.assertEqual(with_d.count("合同金额"), 1)
+        self.assertEqual(no_d.count("合同金额"), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

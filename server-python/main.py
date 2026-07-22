@@ -54,8 +54,12 @@ def _warmup_models_background() -> None:
 
 
 def _yunqi_extract_once_background() -> None:
-    """一次性：OCR 抽取云启 PDF（Shell 沙箱不可用时的旁路）。完成后写 done flag。"""
+    """仅当 SMARTDOC_YUNQI_EXTRACT=1 时：OCR 抽取云启 PDF（运维旁路，默认关闭）。"""
     from pathlib import Path
+
+    flag = (os.environ.get("SMARTDOC_YUNQI_EXTRACT") or "0").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return
 
     scripts = Path(__file__).resolve().parent / "scripts"
     done = scripts / "_yunqi_extract_done.flag"
@@ -83,9 +87,16 @@ async def _lifespan(_app: FastAPI):
     threading.Thread(
         target=_warmup_models_background, daemon=True, name="model-warmup"
     ).start()
-    threading.Thread(
-        target=_yunqi_extract_once_background, daemon=True, name="yunqi-extract"
-    ).start()
+    # 默认不跑；需显式 SMARTDOC_YUNQI_EXTRACT=1
+    if (os.environ.get("SMARTDOC_YUNQI_EXTRACT") or "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        threading.Thread(
+            target=_yunqi_extract_once_background, daemon=True, name="yunqi-extract"
+        ).start()
     yield
 
 
@@ -265,12 +276,20 @@ async def process_document(req: ProcessRequest, request: Request):
 
                     embeddings = await loop.run_in_executor(None, embed_documents, batch)
 
-                    collection.add(
-                        embeddings=embeddings,
-                        documents=batch,
+                    def _add_batch(
+                        emb=embeddings,
+                        docs=batch,
                         ids=batch_ids,
-                        metadatas=batch_metadatas,
-                    )
+                        metas=batch_metadatas,
+                    ):
+                        collection.add(
+                            embeddings=emb,
+                            documents=docs,
+                            ids=ids,
+                            metadatas=metas,
+                        )
+
+                    await loop.run_in_executor(None, _add_batch)
                     wrote_vectors = True
 
                     done = min(start + len(batch), total)
@@ -316,12 +335,20 @@ def _llm_chat_text(messages: list, max_tokens: int = 300) -> str:
     return (resp.choices[0].message.content or "").strip()
 
 
-def sse_ask(req: AskRequest):
+def sse_ask(req: AskRequest, cancel_check=None):
+    """同步生成 SSE 帧；cancel_check() 为 True 时尽早停止（客户端断开）。"""
+
+    def _cancelled() -> bool:
+        return bool(cancel_check and cancel_check())
+
     print(
         f"[MAIN] sse_ask START question={req.question[:50]}... doc_id={req.doc_id} "
         f"history={len(req.history or [])} keep_turns={history_keep_turns()}",
         flush=True,
     )
+    if _cancelled():
+        yield f"data: {json.dumps({'error': '请求已取消'})}\n\n"
+        return
 
     hist = normalize_history(req.history)
     keep = history_keep_messages()
@@ -340,6 +367,9 @@ def sse_ask(req: AskRequest):
         covered = min(covered, need_cover)
         new_older = hist[covered:need_cover]
         if new_older:
+            if _cancelled():
+                yield f"data: {json.dumps({'error': '请求已取消', 'memory_summary': memory_summary, 'memory_covered': covered})}\n\n"
+                return
             memory_summary = merge_memory_summary(
                 memory_summary, new_older, _llm_chat_text
             )
@@ -350,6 +380,10 @@ def sse_ask(req: AskRequest):
             )
         memory_covered = need_cover
 
+    if _cancelled():
+        yield f"data: {json.dumps({'error': '请求已取消', 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
+        return
+
     search_q = rewrite_question(
         req.question,
         memory_summary=memory_summary,
@@ -358,6 +392,10 @@ def sse_ask(req: AskRequest):
     )
     if search_q != (req.question or "").strip():
         print(f"[MAIN] sse_ask rewritten_q={search_q[:80]!r}", flush=True)
+
+    if _cancelled():
+        yield f"data: {json.dumps({'error': '请求已取消', 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
+        return
 
     relevant_chunks = search_similar(search_q, doc_id=req.doc_id)
     if not relevant_chunks:
@@ -368,7 +406,8 @@ def sse_ask(req: AskRequest):
         yield f"data: {json.dumps({'error': msg, 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
         return
 
-    context = format_chunks_for_prompt(relevant_chunks)
+    # 检索路径已去重，此处跳过二次 O(n²) 去重
+    context = format_chunks_for_prompt(relevant_chunks, dedupe=False)
     pages = sorted(
         {
             int(c.get("page") or 0)
@@ -421,29 +460,91 @@ def sse_ask(req: AskRequest):
     )
 
     try:
+        if _cancelled():
+            yield f"data: {json.dumps({'error': '请求已取消', 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
+            return
         stream = client.chat.completions.create(
             model=MODEL_NAME, messages=messages,
             temperature=0.3, max_tokens=500, stream=True,
         )
         for chunk in stream:
+            if _cancelled():
+                print("[MAIN] sse_ask cancelled mid-stream", flush=True)
+                break
             delta = chunk.choices[0].delta
             if delta.content:
                 yield f"data: {json.dumps({'token': delta.content})}\n\n"
+        if _cancelled():
+            yield f"data: {json.dumps({'error': '请求已取消', 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
+            return
         sources = [{"page": p} for p in pages]
         yield f"data: {json.dumps({'done': True, 'sources': sources, 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
     except Exception as e:
         yield f"data: {json.dumps({'error': f'AI 回答生成失败：{str(e)}', 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
 
+
 @app.post("/ai/ask")
 async def ask(req: AskRequest, request: Request):
+    """把同步 sse_ask 放到后台线程，避免阻塞事件循环；客户端断开可取消。"""
     if await request.is_disconnected():
         return StreamingResponse(
             iter([f"data: {json.dumps({'error': '请求已取消'})}\n\n"]),
-            media_type="text/event-stream"
+            media_type="text/event-stream",
         )
+
+    async def generate():
+        loop = asyncio.get_event_loop()
+        out_q: queue.Queue = queue.Queue(maxsize=64)
+        cancel = threading.Event()
+
+        def worker():
+            try:
+                for frame in sse_ask(req, cancel_check=cancel.is_set):
+                    if cancel.is_set():
+                        break
+                    out_q.put(frame)
+            except Exception as e:
+                out_q.put(
+                    f"data: {json.dumps({'error': f'AI 回答生成失败：{str(e)}'})}\n\n"
+                )
+            finally:
+                out_q.put(None)
+
+        threading.Thread(target=worker, daemon=True, name="sse-ask").start()
+
+        async def watch_disconnect():
+            while not cancel.is_set():
+                if await request.is_disconnected():
+                    cancel.set()
+                    print("[MAIN] ask CANCELLED (client disconnect)", flush=True)
+                    return
+                await asyncio.sleep(0.15)
+
+        watch_task = asyncio.create_task(watch_disconnect())
+        try:
+            while True:
+                item = await loop.run_in_executor(None, out_q.get)
+                if item is None:
+                    break
+                yield item
+                if cancel.is_set():
+                    break
+        finally:
+            cancel.set()
+            watch_task.cancel()
+            try:
+                await watch_task
+            except asyncio.CancelledError:
+                pass
+
     return StreamingResponse(
-        sse_ask(req), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 # ==================== AI 摘要 ====================
