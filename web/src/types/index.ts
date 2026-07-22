@@ -27,6 +27,8 @@ export interface Conversation {
   memorySummary?: string;
   /** 已并入滚动摘要的消息条数 */
   memoryCovered?: number;
+  /** 已确认硬事实清单（只追加不改写，与叙述摘要分离） */
+  memoryFacts?: string;
 }
 
 /** 已上传文档信息 */

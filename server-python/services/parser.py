@@ -871,12 +871,15 @@ def iter_parse_events(
                     if tables:
                         region_tables.append(tables)
                     if plain.strip():
+                        # 稳定 ID：p{页码}-{页内序号}，切块拆分后仍可关联同一张图
+                        fig_id = f"p{page_no}-{ri}"
                         items.append(
                             {
                                 "y": float(reg["y"]),
                                 "x": float(reg["x"]),
-                                "text": f"【图内文字 {ri}】\n{plain.strip()}",
+                                "text": f"【图内文字 {fig_id}】\n{plain.strip()}",
                                 "kind": "ocr",
+                                "figure_id": fig_id,
                             }
                         )
 

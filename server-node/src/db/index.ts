@@ -38,7 +38,8 @@ function initTables(database: Database.Database): void {
       messages      TEXT    DEFAULT '[]',
       created_at    TEXT    NOT NULL,
       memory_summary TEXT   DEFAULT '',
-      memory_covered INTEGER DEFAULT 0
+      memory_covered INTEGER DEFAULT 0,
+      memory_facts  TEXT    DEFAULT ''
     );
 
     CREATE TABLE IF NOT EXISTS doc_registry (
@@ -48,13 +49,16 @@ function initTables(database: Database.Database): void {
     );
   `);
 
-  // 兼容旧库：补齐 memory_summary / memory_covered 列
+  // 兼容旧库：补齐 memory_summary / memory_covered / memory_facts 列
   const cols = database.prepare(`PRAGMA table_info(conversations)`).all() as { name: string }[];
   if (!cols.some((c) => c.name === 'memory_summary')) {
     database.exec(`ALTER TABLE conversations ADD COLUMN memory_summary TEXT DEFAULT ''`);
   }
   if (!cols.some((c) => c.name === 'memory_covered')) {
     database.exec(`ALTER TABLE conversations ADD COLUMN memory_covered INTEGER DEFAULT 0`);
+  }
+  if (!cols.some((c) => c.name === 'memory_facts')) {
+    database.exec(`ALTER TABLE conversations ADD COLUMN memory_facts TEXT DEFAULT ''`);
   }
 }
 
@@ -123,6 +127,7 @@ export interface ConversationRow {
   created_at: string;
   memory_summary?: string;
   memory_covered?: number;
+  memory_facts?: string;
 }
 
 /** 获取所有会话列表（按创建时间倒序） */
@@ -141,8 +146,8 @@ export function getConversation(id: string): ConversationRow | undefined {
 export function createConversation(row: ConversationRow): void {
   const d = getDb();
   d.prepare(`
-    INSERT INTO conversations (id, document_name, document_size, summary, doc_id, messages, created_at, memory_summary, memory_covered)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO conversations (id, document_name, document_size, summary, doc_id, messages, created_at, memory_summary, memory_covered, memory_facts)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     row.id,
     row.document_name,
@@ -153,6 +158,7 @@ export function createConversation(row: ConversationRow): void {
     row.created_at,
     row.memory_summary || '',
     row.memory_covered || 0,
+    row.memory_facts || '',
   );
 }
 
@@ -172,6 +178,12 @@ export function updateConversationMemorySummary(id: string, memorySummary: strin
 export function updateConversationMemoryCovered(id: string, covered: number): void {
   const d = getDb();
   d.prepare('UPDATE conversations SET memory_covered = ? WHERE id = ?').run(covered || 0, id);
+}
+
+/** 更新硬事实清单（与叙述摘要分离，只追加不改写） */
+export function updateConversationMemoryFacts(id: string, memoryFacts: string): void {
+  const d = getDb();
+  d.prepare('UPDATE conversations SET memory_facts = ? WHERE id = ?').run(memoryFacts || '', id);
 }
 
 /** 删除会话 */

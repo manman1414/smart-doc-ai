@@ -299,18 +299,30 @@ def search_similar(
     1. 按文档块数自适应初召回（也可显式传 recall_k）
     2. 向量 score < 阈值丢弃
     3. 文本去重
-    4. BGE CrossEncoder 重排（可用 SMARTDOC_RERANK=0 关闭）
+    4. BGE CrossEncoder 重排（可用 SMARTDOC_RERANK=0 关闭；池大小 SMARTDOC_RERANK_POOL）
     5. 自适应取最终 top_k（夹在 TOP_K_MIN~MAX）
 
     返回 [{"text", "page", "score", "kind", ...}, ...]；
     开启重排时 score 为重排分，dense_score 为向量分。
     """
+    import time
+
     from .embedder import embed_query
-    from .reranker import rerank_chunks, rerank_enabled
+    from .reranker import (
+        _rerank_pool_max,
+        is_reranker_ready,
+        rerank_chunks,
+        rerank_enabled,
+    )
 
     q = (query or "").strip()
     if not q:
         return []
+
+    t0 = time.perf_counter()
+
+    def _ms() -> float:
+        return (time.perf_counter() - t0) * 1000
 
     # 先按文档规模估最终条数，再据此算召回；有候选后再按候选数收紧
     final_k = resolve_top_k(doc_id, top_k=top_k)
@@ -323,6 +335,7 @@ def search_similar(
 
     space = _collection_space()
     query_embedding = embed_query(q)
+    print(f"[VECTOR] timing embed_query +{_ms():.0f}ms", flush=True)
 
     kwargs: dict = {
         "query_embeddings": [query_embedding],
@@ -333,6 +346,7 @@ def search_similar(
         kwargs["where"] = {"doc_id": {"$eq": doc_id}}
 
     results = _query_with_fallback(kwargs, doc_id=doc_id, k=fetch_k)
+    print(f"[VECTOR] timing chroma_query +{_ms():.0f}ms", flush=True)
     if results is None:
         return []
 
@@ -360,6 +374,7 @@ def search_similar(
                 "lexical_boost": round(boost, 4),
                 "kind": str(meta.get("kind") or "text"),
                 "source_ext": str(meta.get("source_ext") or ""),
+                "figure_id": str(meta.get("figure_id") or ""),
             }
         )
     scored_all.sort(key=lambda x: x.get("score") or 0.0, reverse=True)
@@ -409,6 +424,7 @@ def search_similar(
                     "lexical_boost": round(boost, 4),
                     "kind": str(meta.get("kind") or "text"),
                     "source_ext": str(meta.get("source_ext") or ""),
+                    "figure_id": str(meta.get("figure_id") or ""),
                 }
             )
         scored_all.sort(key=lambda x: x.get("score") or 0.0, reverse=True)
@@ -426,17 +442,20 @@ def search_similar(
 
     if use_rerank and deduped:
         try:
-            from .reranker import is_reranker_ready
-
             if not is_reranker_ready():
                 out = deduped[:final_k]
                 stage = "dense_warmup"
                 print("[VECTOR] reranker not ready yet, use dense this turn", flush=True)
             else:
-                rerank_pool = deduped[: max(final_k, min(len(deduped), fetch_k))]
-                # 重排只排序，默认不做硬门槛；避免滤空
+                pool_cap = _rerank_pool_max()
+                # 只重排 dense 前列，避免把几十段整段丢进 CrossEncoder
+                rerank_pool = deduped[: min(len(deduped), max(final_k, pool_cap))]
                 out = rerank_chunks(
                     q, rerank_pool, top_k=final_k, min_score=0.0
+                )
+                print(
+                    f"[VECTOR] timing rerank pool={len(rerank_pool)} +{_ms():.0f}ms",
+                    flush=True,
                 )
                 if not out and rerank_pool:
                     out = rerank_pool[:final_k]
@@ -460,7 +479,7 @@ def search_similar(
         f"doc_chunks={doc_n} recall_k={fetch_k} "
         f"recall={len(docs)} after_thresh={len(candidates)} "
         f"after_dedupe={len(deduped)} kept={len(out)} stage={stage} "
-        f"top_k={final_k} thresh={thresh} space={space}",
+        f"top_k={final_k} thresh={thresh} space={space} total_ms={_ms():.0f}",
         flush=True,
     )
     return out

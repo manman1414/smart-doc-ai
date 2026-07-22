@@ -17,8 +17,9 @@ import {
   updateConversationSummary,
   updateConversationMemorySummary,
   updateConversationMemoryCovered,
+  updateConversationMemoryFacts,
 } from '../db';
-import { deleteChromaDoc } from '../services/pythonAi';
+import { deleteChromaDoc, deleteChatMemory } from '../services/pythonAi';
 import { sendJsonError } from '../utils/clientError';
 const router = Router();
 declare module 'express' {
@@ -41,6 +42,7 @@ router.get('/', (_req: Request, res: Response) => {
       createdAt: row.created_at,
       memorySummary: row.memory_summary || '',
       memoryCovered: row.memory_covered || 0,
+      memoryFacts: row.memory_facts || '',
     }));
     res.json(conversations);
   } catch (error: any) {
@@ -51,7 +53,10 @@ router.get('/', (_req: Request, res: Response) => {
 /** 更新会话消息（有 docId 时可创建仅含文档信息的草稿会话，供刷新恢复） */
 router.put('/:id/messages', (req: Request, res: Response) => {
   try {
-    const { messages, documentName, documentSize, summary, docId, createdAt, memorySummary, memoryCovered } = req.body;
+    const {
+      messages, documentName, documentSize, summary, docId, createdAt,
+      memorySummary, memoryCovered, memoryFacts,
+    } = req.body;
     if (!Array.isArray(messages)) {
       return sendJsonError(res, 400, '消息格式不正确');
     }
@@ -75,6 +80,7 @@ router.put('/:id/messages', (req: Request, res: Response) => {
         created_at: createdAt || new Date().toISOString(),
         memory_summary: typeof memorySummary === 'string' ? memorySummary : '',
         memory_covered: typeof memoryCovered === 'number' ? memoryCovered : 0,
+        memory_facts: typeof memoryFacts === 'string' ? memoryFacts : '',
       });
     }
 
@@ -92,6 +98,10 @@ router.put('/:id/messages', (req: Request, res: Response) => {
 
     if (typeof memoryCovered === 'number') {
       updateConversationMemoryCovered(req.params.id, memoryCovered);
+    }
+
+    if (typeof memoryFacts === 'string') {
+      updateConversationMemoryFacts(req.params.id, memoryFacts);
     }
 
     if (messages.length > 0) {
@@ -122,6 +132,7 @@ router.get('/:id', (req: Request, res: Response) => {
       createdAt: row.created_at,
       memorySummary: row.memory_summary || '',
       memoryCovered: row.memory_covered || 0,
+      memoryFacts: row.memory_facts || '',
     });
   } catch (error: any) {
     console.error('获取会话详情失败:', error);
@@ -141,6 +152,7 @@ router.delete('/:id', async (req: Request, res: Response) => {
       await deleteChromaDoc(docId);
       deleteDocRegistry(docId);
     }
+    await deleteChatMemory(req.params.id);
 
     deleteConversationById(req.params.id);
     res.json({ success: true });

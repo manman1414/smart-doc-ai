@@ -10,6 +10,8 @@ import sys
 import asyncio
 import threading
 import queue
+import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from services.chunker import chunk_pages
@@ -25,13 +27,25 @@ from services.embedder import embed_documents, warmup_embedder
 from services.parser import read_file_content, is_read_error, iter_parse_events
 from services.summarizer import summarize_document
 from services.conversation_memory import (
-    split_history,
     merge_memory_summary,
+    merge_memory_facts,
     rewrite_question,
     build_history_prompt_messages,
     history_keep_turns,
     history_keep_messages,
     normalize_history,
+    trim_joined_blocks,
+    final_doc_max_chars,
+    final_chat_max_chars,
+    retrieve_relevant_facts,
+    retrieve_relevant_summary,
+    estimate_messages_chars,
+)
+from services.react_agent import run_react
+from services.chat_memory_store import (
+    index_overflow_messages,
+    search_chat_turns,
+    delete_chat_vectors,
 )
 
 
@@ -134,6 +148,10 @@ class AskRequest(BaseModel):
     memory_summary: str = ""
     # 已并入 memory_summary 的 history 条数（避免每轮重复压缩）
     memory_covered: int = 0
+    # 硬事实清单（只追加不改写，与叙述摘要分离）
+    memory_facts: str = ""
+    # 会话 ID：溢出对话向量按此隔离
+    conversation_id: str = ""
 
 # ==================== 文档处理（SSE 流式 + 可取消） ====================
 
@@ -270,6 +288,8 @@ async def process_document(req: ProcessRequest, request: Request):
                             ),
                             "kind": str(batch_items[j].get("kind") or "text"),
                             "source_ext": src_ext or "",
+                            # 同图多块关联；无则空串（Chroma metadata 不宜 None）
+                            "figure_id": str(batch_items[j].get("figure_id") or ""),
                         }
                         for j in range(len(batch_items))
                     ]
@@ -324,7 +344,7 @@ async def process_document(req: ProcessRequest, request: Request):
 # ==================== RAG 问答 ====================
 
 def _llm_chat_text(messages: list, max_tokens: int = 300) -> str:
-    """同步短调用（摘要合并 / 提问改写）。"""
+    """同步短调用（摘要合并 / 事实抽取 / 提问改写）。"""
     resp = client.chat.completions.create(
         model=MODEL_NAME,
         messages=messages,
@@ -335,11 +355,27 @@ def _llm_chat_text(messages: list, max_tokens: int = 300) -> str:
     return (resp.choices[0].message.content or "").strip()
 
 
+def _memory_sse_fields(memory_summary: str, memory_covered: int, memory_facts: str) -> dict:
+    return {
+        "memory_summary": memory_summary,
+        "memory_covered": memory_covered,
+        "memory_facts": memory_facts,
+    }
+
+
 def sse_ask(req: AskRequest, cancel_check=None):
     """同步生成 SSE 帧；cancel_check() 为 True 时尽早停止（客户端断开）。"""
 
     def _cancelled() -> bool:
         return bool(cancel_check and cancel_check())
+
+    t0 = time.perf_counter()
+
+    def _lap(label: str) -> None:
+        print(
+            f"[MAIN] sse_ask timing {label} +{(time.perf_counter() - t0) * 1000:.0f}ms",
+            flush=True,
+        )
 
     print(
         f"[MAIN] sse_ask START question={req.question[:50]}... doc_id={req.doc_id} "
@@ -353,6 +389,7 @@ def sse_ask(req: AskRequest, cancel_check=None):
     hist = normalize_history(req.history)
     keep = history_keep_messages()
     memory_summary = (req.memory_summary or "").strip()
+    memory_facts = (req.memory_facts or "").strip()
     try:
         covered = max(0, int(req.memory_covered or 0))
     except (TypeError, ValueError):
@@ -368,110 +405,233 @@ def sse_ask(req: AskRequest, cancel_check=None):
         new_older = hist[covered:need_cover]
         if new_older:
             if _cancelled():
-                yield f"data: {json.dumps({'error': '请求已取消', 'memory_summary': memory_summary, 'memory_covered': covered})}\n\n"
+                yield f"data: {json.dumps({'error': '请求已取消', **_memory_sse_fields(memory_summary, covered, memory_facts)})}\n\n"
                 return
-            memory_summary = merge_memory_summary(
-                memory_summary, new_older, _llm_chat_text
-            )
+            yield f"data: {json.dumps({'stage': 'memory', 'message': '压缩记忆中…'}, ensure_ascii=False)}\n\n"
+            conv_id = (req.conversation_id or "").strip()
+
+            def _do_index():
+                if not conv_id:
+                    return 0
+                return index_overflow_messages(
+                    conv_id,
+                    new_older,
+                    start_index=covered,
+                    doc_id=req.doc_id or "",
+                )
+
+            # 事实抽取 / 摘要压缩 / 旧对话入库 并行，缩短答前等待
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                fut_idx = pool.submit(_do_index)
+                fut_facts = pool.submit(
+                    merge_memory_facts, memory_facts, new_older, _llm_chat_text
+                )
+                fut_sum = pool.submit(
+                    merge_memory_summary, memory_summary, new_older, _llm_chat_text
+                )
+                try:
+                    fut_idx.result()
+                except Exception as e:
+                    print(f"[MAIN] index overflow chat failed: {e}", flush=True)
+                memory_facts = fut_facts.result()
+                memory_summary = fut_sum.result()
+            _lap("memory_compress")
             print(
                 f"[MAIN] sse_ask memory +{len(new_older)} msgs "
-                f"summary_chars={len(memory_summary)}",
+                f"summary_chars={len(memory_summary)} facts_chars={len(memory_facts)}",
                 flush=True,
             )
         memory_covered = need_cover
 
+    mem = _memory_sse_fields(memory_summary, memory_covered, memory_facts)
+
     if _cancelled():
-        yield f"data: {json.dumps({'error': '请求已取消', 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
+        yield f"data: {json.dumps({'error': '请求已取消', **mem})}\n\n"
         return
 
-    search_q = rewrite_question(
+    def _rewrite(q: str) -> str:
+        return rewrite_question(
+            q,
+            memory_summary=memory_summary,
+            memory_facts=memory_facts,
+            recent_messages=recent,
+            chat_fn=_llm_chat_text,
+        )
+
+    def _search(query: str) -> list:
+        return search_similar(query, doc_id=req.doc_id) or []
+
+    conv_id = (req.conversation_id or "").strip()
+
+    def _search_chat(query: str) -> list:
+        if not conv_id:
+            return []
+        return search_chat_turns(query, conv_id) or []
+
+    yield f"data: {json.dumps({'stage': 'react', 'message': '检索中…'}, ensure_ascii=False)}\n\n"
+    react = run_react(
         req.question,
         memory_summary=memory_summary,
+        memory_facts=memory_facts,
         recent_messages=recent,
         chat_fn=_llm_chat_text,
+        search_fn=_search,
+        search_chat_fn=_search_chat if conv_id else None,
+        rewrite_fn=_rewrite,
+        cancel_check=_cancelled,
     )
-    if search_q != (req.question or "").strip():
-        print(f"[MAIN] sse_ask rewritten_q={search_q[:80]!r}", flush=True)
+    _lap(f"react_{react.finish_reason}")
+    for t in react.trace:
+        yield f"data: {json.dumps({'step': t.get('step'), 'action': t.get('action'), 'thought': (t.get('thought') or '')[:200]}, ensure_ascii=False)}\n\n"
 
-    if _cancelled():
-        yield f"data: {json.dumps({'error': '请求已取消', 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
+    if _cancelled() or react.finish_reason == "cancelled":
+        yield f"data: {json.dumps({'error': '请求已取消', **mem})}\n\n"
         return
 
-    relevant_chunks = search_similar(search_q, doc_id=req.doc_id)
-    if not relevant_chunks:
+    relevant_chunks = react.chunks
+    chat_chunks = react.chat_chunks
+    if react.search_queries:
+        print(f"[MAIN] sse_ask react doc_queries={react.search_queries}", flush=True)
+    if react.chat_queries:
+        print(f"[MAIN] sse_ask react chat_queries={react.chat_queries}", flush=True)
+
+    if not relevant_chunks and not react.used_memory and not chat_chunks:
         if req.doc_id and doc_chunk_count(req.doc_id) > 0:
             msg = "未找到与问题足够相关的内容，请换种问法或换个角度描述。"
         else:
             msg = "未找到相关文档内容，请先上传文档。"
-        yield f"data: {json.dumps({'error': msg, 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
+        yield f"data: {json.dumps({'error': msg, **mem})}\n\n"
         return
 
-    # 主流：用检索 top_k 结果（已去重），不再额外砍到 2 段导致答不全
-    context = format_chunks_for_prompt(relevant_chunks, dedupe=True)
-    try:
-        previews = []
-        for i, c in enumerate(relevant_chunks):
-            t = (c.get("text") or "").strip().replace("\n", " ")
-            previews.append(f"#{i} p={c.get('page')} len={len(t)} {t[:40]!r}")
-        print(f"[MAIN] sse_ask context_chunks={previews}", flush=True)
-    except Exception:
-        pass
-    pages = sorted(
-        {
-            int(c.get("page") or 0)
-            for c in relevant_chunks
-            if int(c.get("page") or 0) > 0
-        }
-    )
-    scores = [c.get("score") for c in relevant_chunks]
+    if not relevant_chunks:
+        # 纯对话回顾 / 旧对话检索
+        context = ""
+        context_numbered = ""
+        pages: list[int] = []
+        print(
+            f"[MAIN] sse_ask react memory/chat-only reason={react.finish_reason} "
+            f"chat_hits={len(chat_chunks)}",
+            flush=True,
+        )
+    else:
+        context = format_chunks_for_prompt(relevant_chunks, dedupe=True)
+        try:
+            previews = []
+            for i, c in enumerate(relevant_chunks):
+                t = (c.get("text") or "").strip().replace("\n", " ")
+                previews.append(f"#{i} p={c.get('page')} len={len(t)} {t[:40]!r}")
+            print(f"[MAIN] sse_ask context_chunks={previews}", flush=True)
+        except Exception:
+            pass
+        pages = sorted(
+            {
+                int(c.get("page") or 0)
+                for c in relevant_chunks
+                if int(c.get("page") or 0) > 0
+            }
+        )
+        scores = [c.get("score") for c in relevant_chunks]
+        print(
+            f"[MAIN] sse_ask retrieved chunks={len(relevant_chunks)} pages={pages} "
+            f"scores={scores} context_chars={len(context)} react={react.finish_reason}",
+            flush=True,
+        )
+        ctx_blocks: list[str] = []
+        for i, c in enumerate(relevant_chunks, 1):
+            t = (c.get("text") or "").strip()
+            if not t:
+                continue
+            ctx_blocks.append(f"【片段{i}】\n{t}")
+        context_numbered = "\n\n".join(ctx_blocks) if ctx_blocks else context
+
+    chat_block = ""
+    if chat_chunks:
+        lines = []
+        for i, c in enumerate(chat_chunks, 1):
+            t = (c.get("text") or "").strip()
+            if t:
+                lines.append(f"【旧对话{i}】\n{t}")
+        if lines:
+            chat_block = "\n\n".join(lines)
+
+    # 最终回答：按主流规模裁剪（存储侧摘要/事实仍可更长）
+    with_doc = bool(relevant_chunks)
+    if with_doc and context_numbered:
+        context_numbered = trim_joined_blocks(context_numbered, final_doc_max_chars())
+    if chat_block:
+        chat_block = trim_joined_blocks(
+            chat_block, final_chat_max_chars(with_doc=with_doc)
+        )
+
+    # 最终回答前：按问题检索相关事实/摘要（非整表粘贴）
+    retrieved_facts = retrieve_relevant_facts(req.question, memory_facts)
+    retrieved_summary = retrieve_relevant_summary(req.question, memory_summary)
+    _lap("memory_retrieve")
     print(
-        f"[MAIN] sse_ask retrieved chunks={len(relevant_chunks)} pages={pages} "
-        f"scores={scores} context_chars={len(context)}",
+        f"[MAIN] sse_ask memory_retrieve "
+        f"facts_chars={len(retrieved_facts)}/{len(memory_facts or '')} "
+        f"summary_chars={len(retrieved_summary)}/{len(memory_summary or '')}",
         flush=True,
     )
 
-    # 统一提示：不要求、不展示页码标注
-    system_content = (
-        "你是文档问答助手。根据【文档片段】回答用户问题。"
-        "写作规则（必须遵守）：\n"
-        "1. 完整覆盖问题相关要点，不要为了短而漏掉关键信息。\n"
-        "2. 每个要点只写一次：禁止复读、禁止把同一段话再说一遍、"
-        "禁止同一标题内容重复出现。\n"
-        "3. 多个片段若讲同一事实，合并成一条写。\n"
-        "4. 不要按片段顺序逐段改写；要综合后输出一份终稿。\n"
-        "5. 分条或分段均可，写完即止，不要回过头再抄一遍。\n"
-        "6. 不要标注页码或出处页（如「第N页」）。"
-    )
-    user_tail = (
-        "请综合文档片段给出一份完整答案（每个要点只出现一次，不要标注页码）。"
-        "开始回答："
-    )
+    if with_doc:
+        system_content = (
+            "你是文档问答助手。依据【文档片段】作答，可参考对话记忆。"
+            "规则：完整覆盖要点；禁止复读；同事实合并；勿标页码；"
+            "与文档冲突时以文档为准。"
+        )
+        extra_chat = f"\n\n【相关历史对话】\n{chat_block}\n" if chat_block else ""
+        user_content = (
+            f"【文档片段】\n{context_numbered}"
+            f"{extra_chat}\n"
+            f"【用户问题】\n{req.question}\n\n"
+            "请给出完整答案（每点只写一次，勿标页码）："
+        )
+        messages = [{"role": "system", "content": system_content}]
+        messages.extend(
+            build_history_prompt_messages(
+                retrieved_summary,
+                recent,
+                memory_facts=retrieved_facts,
+                for_final=True,
+                question="",  # 已检索过，避免二次检索
+            )
+        )
+        messages.append({"role": "user", "content": user_content})
+    else:
+        system_content = (
+            "你是对话助手。依据记忆与旧对话回答；勿编造；不确定就说明。"
+        )
+        mem_parts = []
+        if retrieved_facts:
+            mem_parts.append(f"【相关硬事实】\n{retrieved_facts}")
+        if retrieved_summary:
+            mem_parts.append(f"【相关摘要】\n{retrieved_summary}")
+        mem_part = "\n\n".join(mem_parts) if mem_parts else "（无相关摘要/事实）"
+        chat_part = chat_block or "（无旧对话命中）"
+        user_content = (
+            f"{mem_part}\n\n"
+            f"【相关历史对话】\n{chat_part}\n\n"
+            f"【用户问题】\n{req.question}\n\n"
+            "请根据上述材料回答："
+        )
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ]
 
-    ctx_blocks: list[str] = []
-    for i, c in enumerate(relevant_chunks, 1):
-        t = (c.get("text") or "").strip()
-        if not t:
-            continue
-        ctx_blocks.append(f"【片段{i}】\n{t}")
-    context_numbered = "\n\n".join(ctx_blocks) if ctx_blocks else context
-
-    messages = [{"role": "system", "content": system_content}]
-    messages.extend(build_history_prompt_messages(memory_summary, recent))
-    messages.append(
-        {
-            "role": "user",
-            "content": (
-                f"【文档片段】（可能互相重叠，请合并理解，勿逐段复述）\n"
-                f"{context_numbered}\n\n"
-                f"【用户问题】\n{req.question}\n\n"
-                f"{user_tail}"
-            ),
-        }
+    prompt_chars = estimate_messages_chars(messages)
+    print(
+        f"[MAIN] sse_ask final_prompt_chars={prompt_chars} "
+        f"with_doc={with_doc} doc_cap={final_doc_max_chars()} "
+        f"chat_cap={final_chat_max_chars(with_doc=with_doc)}",
+        flush=True,
     )
-
+    yield f"data: {json.dumps({'stage': 'answer', 'message': '生成回答中…'}, ensure_ascii=False)}\n\n"
+    _lap("before_stream")
     try:
         if _cancelled():
-            yield f"data: {json.dumps({'error': '请求已取消', 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
+            yield f"data: {json.dumps({'error': '请求已取消', **mem})}\n\n"
             return
         try:
             stream = client.chat.completions.create(
@@ -501,13 +661,13 @@ def sse_ask(req: AskRequest, cancel_check=None):
             if delta.content:
                 yield f"data: {json.dumps({'token': delta.content})}\n\n"
         if _cancelled():
-            yield f"data: {json.dumps({'error': '请求已取消', 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
+            yield f"data: {json.dumps({'error': '请求已取消', **mem})}\n\n"
             return
         sources = [{"page": p} for p in pages]
-        yield f"data: {json.dumps({'done': True, 'sources': sources, 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
+        _lap("stream_done")
+        yield f"data: {json.dumps({'done': True, 'sources': sources, **mem})}\n\n"
     except Exception as e:
-        yield f"data: {json.dumps({'error': f'AI 回答生成失败：{str(e)}', 'memory_summary': memory_summary, 'memory_covered': memory_covered})}\n\n"
-
+        yield f"data: {json.dumps({'error': f'AI 回答生成失败：{str(e)}', **mem})}\n\n"
 
 @app.post("/ai/ask")
 async def ask(req: AskRequest, request: Request):
@@ -699,6 +859,13 @@ async def delete_doc(doc_id: str):
     """删除指定 doc_id 的全部向量（对账 / 删会话时调用）"""
     delete_doc_vectors(doc_id)
     return {"ok": True, "doc_id": doc_id}
+
+
+@app.delete("/ai/chat-memory/{conversation_id}")
+async def delete_chat_memory(conversation_id: str):
+    """删除指定会话的溢出对话向量"""
+    delete_chat_vectors(conversation_id)
+    return {"ok": True, "conversation_id": conversation_id}
 
 
 @app.get("/ai/doc-ids")

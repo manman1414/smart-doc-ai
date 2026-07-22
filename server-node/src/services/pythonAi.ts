@@ -27,3 +27,19 @@ export async function deleteChromaDoc(docId: string): Promise<boolean> {
   }
   return true;
 }
+
+/** 删除指定会话的溢出对话向量 */
+export async function deleteChatMemory(conversationId: string): Promise<boolean> {
+  if (!conversationId) return false;
+  const resp = await fetch(
+    `${PYTHON_URL}/ai/chat-memory/${encodeURIComponent(conversationId)}`,
+    { method: 'DELETE' },
+  );
+  if (!resp.ok) {
+    console.error(
+      `[CLEANUP] deleteChatMemory ${conversationId.slice(0, 8)}… failed: ${resp.status}`,
+    );
+    return false;
+  }
+  return true;
+}

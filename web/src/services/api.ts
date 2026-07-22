@@ -204,7 +204,15 @@ export async function* streamChat(
   signal?: AbortSignal,
   memorySummary: string = '',
   memoryCovered: number = 0,
-): AsyncGenerator<{ text: string; done: boolean; memorySummary?: string; memoryCovered?: number }> {
+  memoryFacts: string = '',
+  conversationId: string = '',
+): AsyncGenerator<{
+  text: string;
+  done: boolean;
+  memorySummary?: string;
+  memoryCovered?: number;
+  memoryFacts?: string;
+}> {
   const response = await fetch(`${getApiBase()}/chat/ask`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -214,6 +222,8 @@ export async function* streamChat(
       history,
       memory_summary: memorySummary || '',
       memory_covered: memoryCovered || 0,
+      memory_facts: memoryFacts || '',
+      conversation_id: conversationId || '',
     }),
     signal,
   });
@@ -229,10 +239,17 @@ export async function* streamChat(
   let fullText = '';
   let latestMemory = memorySummary || '';
   let latestCovered = memoryCovered || 0;
+  let latestFacts = memoryFacts || '';
 
   while (true) {
     if (signal?.aborted) {
-      yield { text: fullText, done: true, memorySummary: latestMemory, memoryCovered: latestCovered };
+      yield {
+        text: fullText,
+        done: true,
+        memorySummary: latestMemory,
+        memoryCovered: latestCovered,
+        memoryFacts: latestFacts,
+      };
       return;
     }
 
@@ -255,6 +272,9 @@ export async function* streamChat(
           if (typeof data.memory_covered === 'number') {
             latestCovered = data.memory_covered;
           }
+          if (typeof data.memory_facts === 'string') {
+            latestFacts = data.memory_facts;
+          }
           if (data.error) throw new Error(data.error);
           if (data.done) {
             yield {
@@ -262,6 +282,7 @@ export async function* streamChat(
               done: true,
               memorySummary: latestMemory,
               memoryCovered: latestCovered,
+              memoryFacts: latestFacts,
             };
             return;
           }
@@ -281,6 +302,7 @@ export async function* streamChat(
     done: true,
     memorySummary: latestMemory,
     memoryCovered: latestCovered,
+    memoryFacts: latestFacts,
   };
 }
 
@@ -332,6 +354,7 @@ export async function saveConversation(conv: Conversation): Promise<void> {
       createdAt: conv.createdAt,
       memorySummary: conv.memorySummary || '',
       memoryCovered: conv.memoryCovered || 0,
+      memoryFacts: conv.memoryFacts || '',
     }),
   });
   if (!response.ok) {

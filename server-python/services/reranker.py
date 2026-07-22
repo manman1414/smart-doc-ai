@@ -19,6 +19,23 @@ _load_lock = threading.Lock()
 _loading = False
 
 
+def _rerank_pool_max() -> int:
+    """送进 CrossEncoder 的候选上限；过大在 CPU 上极易拖到十几秒。"""
+    raw = os.environ.get("SMARTDOC_RERANK_POOL", "8")
+    try:
+        return max(3, min(30, int(raw)))
+    except ValueError:
+        return 8
+
+
+def _rerank_text_max_chars() -> int:
+    raw = os.environ.get("SMARTDOC_RERANK_TEXT_CHARS", "480")
+    try:
+        return max(120, min(2000, int(raw)))
+    except ValueError:
+        return 480
+
+
 def rerank_enabled() -> bool:
     raw = (os.environ.get("SMARTDOC_RERANK") or "1").strip().lower()
     return raw not in ("0", "false", "off", "no")
@@ -95,7 +112,8 @@ def rerank_pairs(
     返回 [(原下标, sigmoid分数), ...]，按分数降序；已按 min_score / top_k 截断。
     """
     q = (query or "").strip()
-    docs = [((t or "").strip() or " ") for t in texts]
+    cap = _rerank_text_max_chars()
+    docs = [(((t or "").strip() or " ")[:cap]) for t in texts]
     if not q or not docs:
         return []
 

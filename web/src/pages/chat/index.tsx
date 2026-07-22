@@ -96,6 +96,10 @@ const ChatPage: React.FC = () => {
   const [memoryCovered, setMemoryCovered] = useState(0);
   const memoryCoveredRef = useRef(0);
   useEffect(() => { memoryCoveredRef.current = memoryCovered; }, [memoryCovered]);
+  /** 已确认硬事实清单（与叙述摘要分离） */
+  const [memoryFacts, setMemoryFacts] = useState('');
+  const memoryFactsRef = useRef('');
+  useEffect(() => { memoryFactsRef.current = memoryFacts; }, [memoryFacts]);
   /** 会话创建时间（上传完成时捕获，写入后端后不再变化） */
   const [createdAt, setCreatedAt] = useState('');
   const createdAtRef = useRef('');
@@ -214,6 +218,7 @@ const ChatPage: React.FC = () => {
       setSummary(conv.summary);
       setMemorySummary(conv.memorySummary || '');
       setMemoryCovered(conv.memoryCovered || 0);
+      setMemoryFacts(conv.memoryFacts || '');
       setSummaryOk(!isSummaryError(conv.summary));
       setUploadStatus('done');
       setSuggestedQuestions(getSuggestedQuestions());
@@ -280,6 +285,7 @@ const ChatPage: React.FC = () => {
             createdAt: createdAtRef.current || new Date().toISOString(),
             memorySummary: memorySummaryRef.current || '',
             memoryCovered: memoryCoveredRef.current || 0,
+            memoryFacts: memoryFactsRef.current || '',
           }),
         }).catch(() => {});
       });
@@ -326,8 +332,9 @@ const ChatPage: React.FC = () => {
       messages: chatMessages,
       memorySummary: memorySummary || '',
       memoryCovered: memoryCovered || 0,
+      memoryFacts: memoryFacts || '',
     });
-  }, [messages, summary, doc, conversationId, createdAt, memorySummary, memoryCovered, streaming]);
+  }, [messages, summary, doc, conversationId, createdAt, memorySummary, memoryCovered, memoryFacts, streaming]);
 
   // ======================== 事件处理 ========================
 
@@ -395,6 +402,7 @@ const ChatPage: React.FC = () => {
             setCreatedAt(created);
             setMemorySummary('');
             setMemoryCovered(0);
+            setMemoryFacts('');
             setSummary(event.result.summary);
             setSummaryOk(ok);
             setSuggestedQuestions(getSuggestedQuestions());
@@ -502,12 +510,21 @@ const ChatPage: React.FC = () => {
         ctrl.signal,
         memorySummaryRef.current || '',
         memoryCoveredRef.current || 0,
+        memoryFactsRef.current || '',
+        convIdRef.current || conversationId || '',
       );
-      for await (const { text: chunk, done, memorySummary: nextMem, memoryCovered: nextCovered } of gen) {
+      for await (const {
+        text: chunk,
+        done,
+        memorySummary: nextMem,
+        memoryCovered: nextCovered,
+        memoryFacts: nextFacts,
+      } of gen) {
         if (abortRef.current) break;                    // 用户点了停止
         if (done) {
           if (typeof nextMem === 'string') setMemorySummary(nextMem);
           if (typeof nextCovered === 'number') setMemoryCovered(nextCovered);
+          if (typeof nextFacts === 'string') setMemoryFacts(nextFacts);
         }
         setMessages(prev => prev.map(m =>
           m.id === aiMsgId ? { ...m, content: chunk, isStreaming: !done } : m
@@ -573,6 +590,7 @@ const ChatPage: React.FC = () => {
     setConversationId('');
     setMemorySummary('');
     setMemoryCovered(0);
+    setMemoryFacts('');
     setCreatedAt('');
     setSummary('');
     setSummaryOk(true);

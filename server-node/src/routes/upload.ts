@@ -256,6 +256,7 @@ router.get('/process/:taskId', async (req: Request, res: Response) => {
       created_at: createdAt,
       memory_summary: '',
       memory_covered: 0,
+      memory_facts: '',
     });
     linkDocToConversation(docId, conversationId);
 

@@ -44,7 +44,7 @@ class ChunkerTests(unittest.TestCase):
     def test_figure_section_separate(self):
         text = (
             "正文暗号甲：青云直上。\n\n"
-            "【图内文字 1】\n"
+            "【图内文字 p2-1】\n"
             "暗号乙：紫气东来\n"
             "交换机单价：899\n"
         )
@@ -52,9 +52,54 @@ class ChunkerTests(unittest.TestCase):
         self.assertTrue(any(u["kind"] == "figure" for u in units))
         fig = next(u for u in units if u["kind"] == "figure")
         self.assertIn("紫气东来", fig["text"])
+        self.assertEqual(fig.get("figure_id"), "p2-1")
+        self.assertTrue(fig["text"].startswith("【图内文字 p2-1】"))
         body = next(u for u in units if u["kind"] == "text")
         self.assertIn("青云直上", body["text"])
         self.assertNotIn("紫气东来", body["text"])
+
+    def test_two_long_figures_keep_stable_ids(self):
+        """一页两图、各超长拆多块时，每块保留同一 figure_id，且两图不混。"""
+        fig1 = "图一说明。" * 40
+        fig2 = "图二说明。" * 40
+        text = (
+            f"【图内文字 p5-1】\n{fig1}\n\n"
+            f"【图内文字 p5-2】\n{fig2}\n"
+        )
+        chunks = chunk_pages(
+            [{"page": 5, "text": text}],
+            chunk_size=80,
+            overlap=0,
+            source_ext="pdf",
+        )
+        figs = [c for c in chunks if c.get("kind") == "figure"]
+        self.assertGreaterEqual(len(figs), 4)
+        ids = {c.get("figure_id") for c in figs}
+        self.assertEqual(ids, {"p5-1", "p5-2"})
+        for c in figs:
+            self.assertTrue(
+                c["text"].startswith(f"【图内文字 {c['figure_id']}】"),
+                msg=c["text"][:40],
+            )
+            if c["figure_id"] == "p5-1":
+                self.assertIn("图一说明", c["text"])
+                self.assertNotIn("图二说明", c["text"])
+            else:
+                self.assertIn("图二说明", c["text"])
+                self.assertNotIn("图一说明", c["text"])
+
+    def test_legacy_figure_marker_upgraded_with_page(self):
+        text = "【图内文字 1】\n" + ("旧标记续写。" * 30)
+        chunks = chunk_pages(
+            [{"page": 3, "text": text}],
+            chunk_size=60,
+            overlap=0,
+            source_ext="pdf",
+        )
+        figs = [c for c in chunks if c.get("kind") == "figure"]
+        self.assertTrue(figs)
+        self.assertTrue(all(c.get("figure_id") == "p3-1" for c in figs))
+        self.assertTrue(all(c["text"].startswith("【图内文字 p3-1】") for c in figs))
 
     def test_chunk_pages_kind_and_page(self):
         chunks = chunk_pages(

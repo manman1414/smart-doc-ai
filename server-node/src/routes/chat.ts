@@ -37,7 +37,7 @@ router.post('/ask', async (req: Request, res: Response) => {
   const timeoutId = setTimeout(() => abortController.abort(), 300_000);
 
   try {
-    const { question, doc_id, history, memory_summary, memory_covered } = req.body;
+    const { question, doc_id, history, memory_summary, memory_covered, memory_facts, conversation_id } = req.body;
     if (!question || !doc_id) {
       clearTimeout(timeoutId);
       return sendJsonError(res, 400, '请提供问题和文档信息');
@@ -53,6 +53,8 @@ router.post('/ask', async (req: Request, res: Response) => {
         history: history || [],
         memory_summary: memory_summary || '',
         memory_covered: memory_covered || 0,
+        memory_facts: memory_facts || '',
+        conversation_id: conversation_id || '',
       }),
     });
 

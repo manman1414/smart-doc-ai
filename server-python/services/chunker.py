@@ -66,13 +66,58 @@ def _strategy_default() -> str:
 
 
 _STRUCT_HEAD = re.compile(
-    r"^(【图内文字\s*\d*】|【表格\s*\d*】|【图像表格\s*\d*】)"
+    r"^(【图内文字\s*[^\】]*】|【表格\s*[^\】]*】|【图像表格\s*[^\】]*】)"
 )
+_FIGURE_HEAD = re.compile(r"^【图内文字\s*([^\】]*)】")
 _SENT_SPLIT = re.compile(r"(?<=[。！？；.!?;])\s*")
 _HAS_STRUCTURE = re.compile(
     r"【图内文字|【表格|【图像表格|^\s*\|.+\|\s*$",
     re.M,
 )
+
+
+def _parse_figure_id(title_or_text: str) -> str:
+    """从【图内文字 …】标题解析稳定 ID；无则空串。"""
+    first = (title_or_text or "").strip().split("\n", 1)[0].strip()
+    m = _FIGURE_HEAD.match(first)
+    if not m:
+        return ""
+    return (m.group(1) or "").strip()
+
+
+def _figure_marker(figure_id: str) -> str:
+    fid = (figure_id or "").strip()
+    return f"【图内文字 {fid}】" if fid else "【图内文字】"
+
+
+def _stamp_figure_chunks(
+    pieces: list[dict],
+    figure_id: str,
+) -> list[dict]:
+    """给同一张图拆出的每一段都打上同一 figure_id 标记（正文+元数据）。"""
+    if not pieces:
+        return []
+    marker = _figure_marker(figure_id)
+    fid = (figure_id or "").strip()
+    out: list[dict] = []
+    for p in pieces:
+        body = (p.get("text") or "").strip()
+        if not body:
+            continue
+        # 去掉旧标题，避免重复叠加
+        if _FIGURE_HEAD.match(body.split("\n", 1)[0].strip()):
+            rest = body.split("\n", 1)
+            body = rest[1].strip() if len(rest) > 1 else ""
+        if not body:
+            continue
+        item = {
+            "text": f"{marker}\n{body}",
+            "kind": "figure",
+        }
+        if fid:
+            item["figure_id"] = fid
+        out.append(item)
+    return out
 
 
 def resolve_strategy(strategy: str | None, sample_text: str = "", source_ext: str = "") -> str:
@@ -124,7 +169,7 @@ def _merge_tiny_units(
     chunk_size: int,
     min_ratio: float | None = None,
 ) -> list[dict]:
-    """同 kind 的过短单元合并；不跨 table/figure/text。"""
+    """同 kind 的过短单元合并；不跨 table/figure/text；不同 figure_id 不合并。"""
     ratio = _min_chunk_ratio() if min_ratio is None else min_ratio
     if ratio <= 0 or not units:
         return units
@@ -135,11 +180,16 @@ def _merge_tiny_units(
         if not text:
             continue
         kind = u.get("kind") or "text"
+        fid = str(u.get("figure_id") or "").strip()
         item = {"text": text, "kind": kind}
+        if fid:
+            item["figure_id"] = fid
+        same_fig = (out[-1].get("figure_id") or "") == fid if out else False
         if (
             out
             and len(text) < min_len
             and (out[-1].get("kind") or "text") == kind
+            and (kind != "figure" or same_fig)
         ):
             out[-1]["text"] = (out[-1]["text"] + "\n" + text).strip()
         else:
@@ -148,6 +198,10 @@ def _merge_tiny_units(
         len(out) >= 2
         and len(out[-1]["text"]) < min_len
         and (out[-2].get("kind") or "text") == (out[-1].get("kind") or "text")
+        and (
+            (out[-1].get("kind") or "") != "figure"
+            or (out[-2].get("figure_id") or "") == (out[-1].get("figure_id") or "")
+        )
     ):
         tail = out.pop()
         out[-1]["text"] = (out[-1]["text"] + "\n" + tail["text"]).strip()
@@ -372,33 +426,54 @@ def chunk_pages(
             source_ext=source_ext,
         )
         for unit in page_units:
-            out.append(
-                {
-                    "text": unit["text"],
-                    "page": page_no,
-                    "kind": unit.get("kind") or "text",
-                    "strategy": page_mode,
-                }
-            )
+            item = {
+                "text": unit["text"],
+                "page": page_no,
+                "kind": unit.get("kind") or "text",
+                "strategy": page_mode,
+            }
+            fid = str(unit.get("figure_id") or "").strip()
+            if not fid and item["kind"] == "figure":
+                fid = _parse_figure_id(item["text"])
+            # 旧格式「图内文字 1」补全为页级稳定 ID：p{page}-{n}
+            if fid and re.fullmatch(r"\d+", fid):
+                fid = f"p{page_no}-{fid}"
+            if fid:
+                item["figure_id"] = fid
+                if item["kind"] == "figure":
+                    stamped = _stamp_figure_chunks(
+                        [{"text": item["text"], "kind": "figure"}], fid
+                    )
+                    if stamped:
+                        item["text"] = stamped[0]["text"]
+            out.append(item)
     return out
 
 
 def _iter_structural_units(text: str) -> Iterable[dict]:
-    """拆成结构单元：普通段落 / 表格 / 图内文字。"""
+    """拆成结构单元：普通段落 / 表格 / 图内文字（带 figure_id）。"""
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     buf: list[str] = []
     kind = "text"
+    figure_id = ""
     i = 0
     n = len(lines)
 
     def flush():
-        nonlocal buf, kind
+        nonlocal buf, kind, figure_id
         body = "\n".join(buf).strip()
         prev_kind = kind
+        prev_fid = figure_id
         buf = []
         kind = "text"
+        figure_id = ""
         if body:
-            yield {"text": body, "kind": prev_kind}
+            item = {"text": body, "kind": prev_kind}
+            if prev_kind == "figure":
+                parsed = prev_fid or _parse_figure_id(body)
+                if parsed:
+                    item["figure_id"] = parsed
+            yield item
 
     while i < n:
         line = lines[i]
@@ -420,7 +495,12 @@ def _iter_structural_units(text: str) -> Iterable[dict]:
         if m:
             yield from flush()
             title = stripped
-            kind = "figure" if ("图内" in title or "图像表格" in title) else "table"
+            if "图内" in title or "图像表格" in title:
+                kind = "figure"
+                figure_id = _parse_figure_id(title)
+            else:
+                kind = "table"
+                figure_id = ""
             buf = [title]
             i += 1
             while i < n:
@@ -461,8 +541,16 @@ def _pack_sentence_stream(
     kind: str,
     chunk_size: int,
     overlap: int,
+    figure_id: str = "",
 ) -> list[dict]:
-    chunks: list[dict] = []
+    """按句装箱。figure 带 figure_id 时预留标题长度，最后每段统一打标。"""
+    fid = (figure_id or "").strip()
+    marker = _figure_marker(fid) if (kind == "figure" and fid) else ""
+    body_limit = chunk_size
+    if marker:
+        body_limit = max(32, chunk_size - len(marker) - 1)
+
+    raw_chunks: list[dict] = []
     cur: list[str] = []
     cur_len = 0
 
@@ -470,26 +558,38 @@ def _pack_sentence_stream(
         nonlocal cur, cur_len
         if not cur:
             return
-        chunks.append({"text": "\n".join(cur).strip(), "kind": kind})
+        item = {"text": "\n".join(cur).strip(), "kind": kind}
+        if fid and kind == "figure":
+            item["figure_id"] = fid
+        raw_chunks.append(item)
         cur = []
         cur_len = 0
 
     for sent in sentences:
         if not sent:
             continue
-        if len(sent) > chunk_size:
+        if kind == "figure" and _FIGURE_HEAD.match(sent.strip()):
+            if not fid:
+                fid = _parse_figure_id(sent)
+                marker = _figure_marker(fid) if fid else ""
+                if marker:
+                    body_limit = max(32, chunk_size - len(marker) - 1)
+            continue
+        if len(sent) > body_limit:
             flush()
-            for piece in _hard_split(sent, chunk_size):
-                chunks.append({"text": piece, "kind": kind})
+            for piece in _hard_split(sent, body_limit):
+                item = {"text": piece, "kind": kind}
+                if fid and kind == "figure":
+                    item["figure_id"] = fid
+                raw_chunks.append(item)
             continue
         add = len(sent) + (1 if cur else 0)
-        if cur and cur_len + add > chunk_size:
+        if cur and cur_len + add > body_limit:
             flush()
-            if overlap > 0 and chunks:
-                # 带上一块尾巴，但保证本块不超过 chunk_size
-                prev_text = chunks[-1]["text"]
+            if overlap > 0 and raw_chunks:
+                prev_text = raw_chunks[-1]["text"]
                 sep = "\n"
-                room = max(0, chunk_size - len(sent) - len(sep))
+                room = max(0, body_limit - len(sent) - len(sep))
                 take = min(overlap, room, len(prev_text))
                 if take > 0:
                     carry = prev_text[-take:]
@@ -505,7 +605,10 @@ def _pack_sentence_stream(
             cur.append(sent)
             cur_len = len("\n".join(cur))
     flush()
-    return chunks
+
+    if kind == "figure" and fid:
+        return _stamp_figure_chunks(raw_chunks, fid)
+    return raw_chunks
 
 
 def _pack_units(
@@ -529,14 +632,23 @@ def _pack_units(
                     out.append({"text": piece, "kind": "table"})
             continue
 
-        # text / figure：按句装箱
-        sents = _split_sentences(utext)
+        fid = str(unit.get("figure_id") or "").strip() or _parse_figure_id(utext)
+        body = utext
+        if ukind == "figure" and _FIGURE_HEAD.match(utext.split("\n", 1)[0].strip()):
+            parts = utext.split("\n", 1)
+            body = parts[1].strip() if len(parts) > 1 else ""
+            if not fid:
+                fid = _parse_figure_id(parts[0])
+        if not body:
+            continue
+        sents = _split_sentences(body)
         out.extend(
             _pack_sentence_stream(
                 sents,
                 kind=ukind if ukind in ("text", "figure") else "text",
                 chunk_size=chunk_size,
                 overlap=overlap,
+                figure_id=fid if ukind == "figure" else "",
             )
         )
     return out
